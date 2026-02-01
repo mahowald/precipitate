@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "onnxruntime>=1.23.2",
     "pydantic>=2.12.5",
     "torch>=2.10.0",
     "transformers>=5.0.0",
@@ -23,3 +24,10 @@ dev = [
     "pytest>=9.0.2",
     "ruff>=0.14.14",
 ]
+
+[tool.ruff]
+fix = true
+
+[tool.ruff.lint]
+extend-select = ["I", "ANN", "RUF", "ASYNC", "PTH", "SIM", "FURB"]
+ignore = ["ANN003", "ANN002"]
