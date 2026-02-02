@@ -32,10 +32,12 @@ class StructuredOutputDataset(Dataset[dict[str, torch.Tensor]]):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: torch.Tensor,
+        token_type_ids: torch.Tensor,
     ) -> None:
         self.input_ids = input_ids
         self.attention_mask = attention_mask
         self.labels = labels
+        self.token_type_ids = token_type_ids
 
     def __len__(self) -> int:
         return len(self.input_ids)
@@ -45,6 +47,7 @@ class StructuredOutputDataset(Dataset[dict[str, torch.Tensor]]):
             "input_ids": self.input_ids[idx],
             "attention_mask": self.attention_mask[idx],
             "labels": self.labels[idx],
+            "token_type_ids": self.token_type_ids[idx],
         }
 
 
@@ -56,10 +59,12 @@ class DistillationDataset(Dataset[dict[str, torch.Tensor]]):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: torch.Tensor,
+        token_type_ids: torch.Tensor,
     ) -> None:
         self.input_ids = input_ids
         self.attention_mask = attention_mask
         self.labels = labels
+        self.token_type_ids = token_type_ids
 
     def __len__(self) -> int:
         return len(self.input_ids)
@@ -69,6 +74,7 @@ class DistillationDataset(Dataset[dict[str, torch.Tensor]]):
             "input_ids": self.input_ids[idx],
             "attention_mask": self.attention_mask[idx],
             "labels": self.labels[idx],
+            "token_type_ids": self.token_type_ids[idx],
         }
 
 
@@ -148,7 +154,7 @@ class DistillationTrainer(Trainer):  # type: ignore[misc]
         return (loss, outputs) if return_outputs else loss
 
 
-class HuggingFaceModel(Generic[T]):
+class HuggingfaceModel(Generic[T]):
     """HuggingFace Transformers implementation of the Model protocol."""
 
     def __init__(
@@ -238,7 +244,7 @@ class HuggingFaceModel(Generic[T]):
 
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
-                torch_dtype=dtype,
+                dtype=dtype,
             )
             model.to(device)  # type: ignore[arg-type]
             self._model = cast(PreTrainedModel, model)
@@ -272,7 +278,7 @@ class HuggingFaceModel(Generic[T]):
         inputs: Sequence[str],
         outputs: Sequence[T],
         tokenizer: PreTrainedTokenizerBase,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Tokenize inputs and outputs for training with masked labels."""
         all_input_ids: list[list[int]] = []
         all_labels: list[list[int]] = []
@@ -328,17 +334,21 @@ class HuggingFaceModel(Generic[T]):
         padded_input_ids: list[list[int]] = []
         padded_attention_mask: list[list[int]] = []
         padded_labels: list[list[int]] = []
+        padded_token_type_ids: list[list[int]] = []
 
         for ids, lbls in zip(all_input_ids, all_labels, strict=True):
             padding_length = max_len - len(ids)
             padded_input_ids.append(ids + [pad_token_id] * padding_length)  # type: ignore[arg-type]
             padded_attention_mask.append([1] * len(ids) + [0] * padding_length)
             padded_labels.append(lbls + [-100] * padding_length)
+            # Generate token_type_ids as all 0s (for text-only fine-tuning)
+            padded_token_type_ids.append([0] * max_len)
 
         return (
             torch.tensor(padded_input_ids),
             torch.tensor(padded_attention_mask),
             torch.tensor(padded_labels),
+            torch.tensor(padded_token_type_ids),
         )
 
     def fit(self, inputs: list[str], outputs: list[T]) -> None:
@@ -353,7 +363,7 @@ class HuggingFaceModel(Generic[T]):
         model, tokenizer = self._load_model_and_tokenizer()
 
         # Tokenize with masked labels
-        input_ids, attention_mask, labels = self._tokenize_for_training(
+        input_ids, attention_mask, labels, token_type_ids = self._tokenize_for_training(
             inputs, outputs, tokenizer
         )
 
@@ -362,7 +372,16 @@ class HuggingFaceModel(Generic[T]):
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
+            token_type_ids=token_type_ids,
         )
+
+        # Calculate warmup_steps from warmup_ratio with gradient accumulation
+        effective_batch_size = self.batch_size * self.gradient_accumulation_steps
+        num_update_steps_per_epoch = max(
+            1, (len(dataset) + effective_batch_size - 1) // effective_batch_size
+        )
+        total_steps = num_update_steps_per_epoch * self.num_epochs
+        warmup_steps = int(self.warmup_ratio * total_steps)
 
         # Configure training
         training_args = TrainingArguments(
@@ -371,7 +390,7 @@ class HuggingFaceModel(Generic[T]):
             per_device_train_batch_size=self.batch_size,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             learning_rate=self.learning_rate,
-            warmup_ratio=self.warmup_ratio,
+            warmup_steps=warmup_steps,
             weight_decay=self.weight_decay,
             logging_steps=10,
             save_strategy="epoch",
@@ -461,7 +480,7 @@ class HuggingFaceModel(Generic[T]):
         raise ValueError(msg)
 
     def distill(
-        self, student: HuggingFaceModel[T], inputs: list[str], outputs: list[T]
+        self, student: HuggingfaceModel[T], inputs: list[str], outputs: list[T]
     ) -> None:
         """Distill knowledge from this model (teacher) to the student model.
 
@@ -479,8 +498,8 @@ class HuggingFaceModel(Generic[T]):
         teacher_model.eval()  # Teacher is frozen
 
         # Tokenize with student tokenizer
-        input_ids, attention_mask, labels = student._tokenize_for_training(
-            inputs, outputs, student_tokenizer
+        input_ids, attention_mask, labels, token_type_ids = (
+            student._tokenize_for_training(inputs, outputs, student_tokenizer)
         )
 
         # Create dataset
@@ -488,7 +507,16 @@ class HuggingFaceModel(Generic[T]):
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
+            token_type_ids=token_type_ids,
         )
+
+        # Calculate warmup_steps from warmup_ratio with gradient accumulation
+        effective_batch_size = student.batch_size * student.gradient_accumulation_steps
+        num_update_steps_per_epoch = max(
+            1, (len(dataset) + effective_batch_size - 1) // effective_batch_size
+        )
+        total_steps = num_update_steps_per_epoch * student.num_epochs
+        warmup_steps = int(student.warmup_ratio * total_steps)
 
         # Configure training
         training_args = TrainingArguments(
@@ -497,7 +525,7 @@ class HuggingFaceModel(Generic[T]):
             per_device_train_batch_size=student.batch_size,
             gradient_accumulation_steps=student.gradient_accumulation_steps,
             learning_rate=student.learning_rate,
-            warmup_ratio=student.warmup_ratio,
+            warmup_steps=warmup_steps,
             weight_decay=student.weight_decay,
             logging_steps=10,
             save_strategy="epoch",

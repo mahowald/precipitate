@@ -9,7 +9,7 @@ from conftest import SampleOutput
 from precipitate.huggingface import (
     DistillationDataset,
     DistillationTrainer,
-    HuggingFaceModel,
+    HuggingfaceModel,
     StructuredOutputDataset,
 )
 
@@ -26,8 +26,11 @@ class TestStructuredOutputDataset:
         input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
         attention_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
         labels = torch.tensor([[1, 2, 3], [4, 5, -100]])
+        token_type_ids = torch.tensor([[0, 0, 0], [0, 0, 0]])
 
-        dataset = StructuredOutputDataset(input_ids, attention_mask, labels)
+        dataset = StructuredOutputDataset(
+            input_ids, attention_mask, labels, token_type_ids
+        )
         assert len(dataset) == 2
 
     def test_getitem(self) -> None:
@@ -35,16 +38,21 @@ class TestStructuredOutputDataset:
         input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
         attention_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
         labels = torch.tensor([[1, 2, 3], [4, 5, -100]])
+        token_type_ids = torch.tensor([[0, 0, 0], [0, 0, 0]])
 
-        dataset = StructuredOutputDataset(input_ids, attention_mask, labels)
+        dataset = StructuredOutputDataset(
+            input_ids, attention_mask, labels, token_type_ids
+        )
         item = dataset[0]
 
         assert "input_ids" in item
         assert "attention_mask" in item
         assert "labels" in item
+        assert "token_type_ids" in item
         assert torch.equal(item["input_ids"], torch.tensor([1, 2, 3]))
         assert torch.equal(item["attention_mask"], torch.tensor([1, 1, 1]))
         assert torch.equal(item["labels"], torch.tensor([1, 2, 3]))
+        assert torch.equal(item["token_type_ids"], torch.tensor([0, 0, 0]))
 
 
 class TestDistillationDataset:
@@ -55,8 +63,9 @@ class TestDistillationDataset:
         input_ids = torch.tensor([[1, 2, 3]])
         attention_mask = torch.tensor([[1, 1, 1]])
         labels = torch.tensor([[-100, -100, 3]])
+        token_type_ids = torch.tensor([[0, 0, 0]])
 
-        dataset = DistillationDataset(input_ids, attention_mask, labels)
+        dataset = DistillationDataset(input_ids, attention_mask, labels, token_type_ids)
         assert len(dataset) == 1
 
     def test_getitem(self) -> None:
@@ -64,13 +73,15 @@ class TestDistillationDataset:
         input_ids = torch.tensor([[1, 2, 3]])
         attention_mask = torch.tensor([[1, 1, 1]])
         labels = torch.tensor([[-100, -100, 3]])
+        token_type_ids = torch.tensor([[0, 0, 0]])
 
-        dataset = DistillationDataset(input_ids, attention_mask, labels)
+        dataset = DistillationDataset(input_ids, attention_mask, labels, token_type_ids)
         item = dataset[0]
 
         assert "input_ids" in item
         assert "attention_mask" in item
         assert "labels" in item
+        assert "token_type_ids" in item
 
 
 # =============================================================================
@@ -81,9 +92,11 @@ class TestDistillationDataset:
 class TestHuggingFaceModelInit:
     """Tests for HuggingFaceModel initialization."""
 
-    def test_init_stores_parameters(self, sample_output_type: type[SampleOutput]) -> None:
+    def test_init_stores_parameters(
+        self, sample_output_type: type[SampleOutput]
+    ) -> None:
         """Test that all init params are stored correctly."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
             system_prompt="Test prompt",
@@ -103,7 +116,7 @@ class TestHuggingFaceModelInit:
 
     def test_init_defaults(self, sample_output_type: type[SampleOutput]) -> None:
         """Test that default values are set correctly."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
         )
@@ -124,7 +137,7 @@ class TestHuggingFaceModelInit:
 
     def test_lazy_loading(self, sample_output_type: type[SampleOutput]) -> None:
         """Test that model/tokenizer are None until first use."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
         )
@@ -144,7 +157,7 @@ class TestDeviceDetection:
 
     def test_get_device_explicit(self, sample_output_type: type[SampleOutput]) -> None:
         """Test when device is explicitly set."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
             device="cpu",
@@ -155,7 +168,7 @@ class TestDeviceDetection:
 
     def test_get_device_cached(self, sample_output_type: type[SampleOutput]) -> None:
         """Test that device is cached after first call."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
             device="cpu",
@@ -175,7 +188,7 @@ class TestDeviceDetection:
         sample_output_type: type[SampleOutput],
     ) -> None:
         """Test auto-detection falls back to CPU."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
         )
@@ -194,7 +207,7 @@ class TestBuildChatMessages:
 
     def test_no_system_prompt(self, sample_output_type: type[SampleOutput]) -> None:
         """Test building messages without system prompt."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
         )
@@ -205,7 +218,7 @@ class TestBuildChatMessages:
 
     def test_with_system_prompt(self, sample_output_type: type[SampleOutput]) -> None:
         """Test building messages with system prompt."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
             system_prompt="You are helpful",
@@ -218,7 +231,7 @@ class TestBuildChatMessages:
 
     def test_with_output(self, sample_output_type: type[SampleOutput]) -> None:
         """Test building messages with output JSON."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
             system_prompt="You are helpful",
@@ -241,7 +254,7 @@ class TestExtractAndParseJson:
 
     def test_clean_json(self, sample_output_type: type[SampleOutput]) -> None:
         """Test parsing clean JSON."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
         )
@@ -252,7 +265,7 @@ class TestExtractAndParseJson:
 
     def test_json_with_prefix(self, sample_output_type: type[SampleOutput]) -> None:
         """Test extracting JSON with text before it."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
         )
@@ -265,7 +278,7 @@ class TestExtractAndParseJson:
 
     def test_json_with_suffix(self, sample_output_type: type[SampleOutput]) -> None:
         """Test extracting JSON with text after it."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
         )
@@ -276,9 +289,11 @@ class TestExtractAndParseJson:
         assert result.name == "Charlie"
         assert result.value == 99
 
-    def test_json_extraction_failure(self, sample_output_type: type[SampleOutput]) -> None:
+    def test_json_extraction_failure(
+        self, sample_output_type: type[SampleOutput]
+    ) -> None:
         """Test ValueError is raised for invalid JSON."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
         )
@@ -301,12 +316,14 @@ class TestFit:
         sample_outputs: list[SampleOutput],
     ) -> None:
         """Test that ValueError is raised when inputs/outputs lengths differ."""
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
         )
 
-        with pytest.raises(ValueError, match="inputs and outputs must have same length"):
+        with pytest.raises(
+            ValueError, match="inputs and outputs must have same length"
+        ):
             model.fit(["input1"], sample_outputs)  # 1 input, 2 outputs
 
     @patch("precipitate.huggingface.TrainingArguments")
@@ -329,7 +346,7 @@ class TestFit:
         mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
         mock_auto_model.from_pretrained.return_value = mock_model
 
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
             device="cpu",
@@ -367,7 +384,7 @@ class TestPredict:
         # Override decode to return valid JSON
         mock_tokenizer.decode = lambda x, **kwargs: '{"name": "Test", "value": 123}'
 
-        model = HuggingFaceModel(
+        model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
             device="cpu",
@@ -395,16 +412,18 @@ class TestDistill:
         sample_outputs: list[SampleOutput],
     ) -> None:
         """Test that ValueError is raised when inputs/outputs lengths differ."""
-        teacher = HuggingFaceModel(
+        teacher = HuggingfaceModel(
             model_name="teacher-model",
             output_type=sample_output_type,
         )
-        student = HuggingFaceModel(
+        student = HuggingfaceModel(
             model_name="student-model",
             output_type=sample_output_type,
         )
 
-        with pytest.raises(ValueError, match="inputs and outputs must have same length"):
+        with pytest.raises(
+            ValueError, match="inputs and outputs must have same length"
+        ):
             teacher.distill(student, ["input1"], sample_outputs)
 
 

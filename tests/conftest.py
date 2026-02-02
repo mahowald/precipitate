@@ -92,7 +92,9 @@ def mock_tokenizer() -> MagicMock:
     tokenizer.side_effect = tokenize_call
     tokenizer.__call__ = tokenize_call
 
-    def decode(token_ids: torch.Tensor | list[int], skip_special_tokens: bool = True) -> str:
+    def decode(
+        token_ids: torch.Tensor | list[int], skip_special_tokens: bool = True
+    ) -> str:
         """Simulate decoding."""
         return '{"name": "Test", "value": 123}'
 
