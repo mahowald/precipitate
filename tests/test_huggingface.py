@@ -614,3 +614,192 @@ class TestChatTemplateFallback:
         assert "User: Hello" in result
         assert "Assistant: " in result
         assert "System:" not in result
+
+
+# =============================================================================
+# Label Masking Tests
+# =============================================================================
+
+
+class TestLabelMasking:
+    """Tests for correct label masking in training tokenization."""
+
+    def test_tokenization_boundary_effects(
+        self, sample_output_type: type[SampleOutput]
+    ) -> None:
+        """Test that label masking works correctly with tokenization boundary effects.
+
+        This test simulates a tokenizer where the boundary between prompt and
+        response is handled differently depending on context (e.g., space absorbed
+        into next token).
+        """
+        # Create a mock tokenizer with boundary effects
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+        mock_tokenizer.chat_template = None
+
+        # Simulate boundary effect: "Assistant: " vs "Assistant: {"
+        # When tokenizing "Assistant: ", the space is a separate token: [100, 101, 102]
+        # When tokenizing "Assistant: {", the space is absorbed: [100, 101, 103, ...]
+        def mock_tokenize(
+            text: str, truncation: bool = True, return_tensors: str | None = None
+        ) -> dict[str, list[int]]:
+            # Simulate different tokenization based on content
+            if text.endswith("Assistant: "):
+                # Prompt with generation prompt: separate space token
+                tokens = [10, 11, 12, 100, 101, 102]  # User: Hello\n\nAssistant:
+            elif "Assistant: {" in text:
+                # Full conversation: space absorbed into next token
+                tokens = [
+                    10,
+                    11,
+                    12,
+                    100,
+                    101,
+                    103,
+                    104,
+                    105,
+                ]  # User: Hello\n\nAssistant: {"name": "Test", "value": 42}
+            else:
+                # Just the user message (shouldn't happen with current implementation)
+                tokens = [10, 11, 12]
+
+            return {"input_ids": tokens, "attention_mask": [1] * len(tokens)}
+
+        mock_tokenizer.side_effect = mock_tokenize
+        mock_tokenizer.__call__ = mock_tokenize
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            max_seq_length=100,
+        )
+
+        # Create sample data
+        inputs = ["Hello"]
+        outputs = [SampleOutput(name="Test", value=42)]
+
+        # Tokenize for training
+        input_ids, attention_mask, labels, token_type_ids = (
+            model._tokenize_for_training(inputs, outputs, mock_tokenizer)
+        )
+
+        # Verify shapes
+        assert input_ids.shape[0] == 1
+        assert labels.shape[0] == 1
+
+        # Verify that prompt tokens are masked
+        # Tokens 0-4 are common (User: Hello\n\nAssistant:), should be masked
+        # Token 5 diverges (102 vs 103), so response starts there
+        labels_list = labels[0].tolist()
+        assert labels_list[0] == -100, "Token 0 should be masked"
+        assert labels_list[1] == -100, "Token 1 should be masked"
+        assert labels_list[2] == -100, "Token 2 should be masked"
+        assert labels_list[3] == -100, "Token 3 should be masked"
+        assert labels_list[4] == -100, "Token 4 should be masked"
+        # Tokens 5-7 are response tokens, should not be masked
+        assert labels_list[5] != -100, "Token 5 (response start) should not be masked"
+        assert labels_list[6] != -100, "Token 6 (response) should not be masked"
+        assert labels_list[7] != -100, "Token 7 (response) should not be masked"
+
+    def test_prompt_too_long(self, sample_output_type: type[SampleOutput]) -> None:
+        """Test that examples with prompts exceeding max_seq_length are skipped."""
+        # Create a mock tokenizer that produces long prompts
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+        mock_tokenizer.chat_template = None
+
+        def mock_tokenize(
+            text: str, truncation: bool = True, return_tensors: str | None = None
+        ) -> dict[str, list[int]]:
+            if text.endswith("Assistant: "):
+                # Prompt is 150 tokens (exceeds max_seq_length of 100)
+                tokens = list(range(150))
+            elif "Assistant: {" in text:
+                # Full conversation is 155 tokens
+                tokens = list(range(155))
+            else:
+                tokens = list(range(150))
+
+            return {"input_ids": tokens, "attention_mask": [1] * len(tokens)}
+
+        mock_tokenizer.side_effect = mock_tokenize
+        mock_tokenizer.__call__ = mock_tokenize
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            max_seq_length=100,
+        )
+
+        # Create sample data - all examples have prompts that are too long
+        inputs = ["Very long input text"] * 2
+        outputs = [SampleOutput(name="Test", value=42)] * 2
+
+        # This should raise ValueError because all examples are skipped
+        with pytest.raises(ValueError, match="All training examples were skipped"):
+            model._tokenize_for_training(inputs, outputs, mock_tokenizer)
+
+    def test_partial_prompt_skipping(
+        self, sample_output_type: type[SampleOutput]
+    ) -> None:
+        """Test that only prompts exceeding max_seq_length are skipped."""
+        # Create a mock tokenizer with mixed prompt lengths
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+        mock_tokenizer.chat_template = None
+
+        call_count = 0
+
+        def mock_tokenize(
+            text: str, truncation: bool = True, return_tensors: str | None = None
+        ) -> dict[str, list[int]]:
+            nonlocal call_count
+            call_count += 1
+
+            # Alternate between short and long prompts
+            # First call pair (example 1): short prompt
+            # Second call pair (example 2): long prompt
+            # Third call pair (example 3): short prompt
+            example_num = (call_count - 1) // 2
+
+            if example_num == 1:
+                # Second example: prompt too long
+                if text.endswith("Assistant: "):
+                    tokens = list(range(150))  # Too long
+                else:
+                    tokens = list(range(155))
+            else:
+                # First and third examples: normal length
+                if text.endswith("Assistant: "):
+                    tokens = [10, 11, 12, 100, 101, 102]
+                else:
+                    tokens = [10, 11, 12, 100, 101, 103, 104, 105]
+
+            return {"input_ids": tokens, "attention_mask": [1] * len(tokens)}
+
+        mock_tokenizer.side_effect = mock_tokenize
+        mock_tokenizer.__call__ = mock_tokenize
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            max_seq_length=100,
+        )
+
+        # Create sample data: 3 examples, middle one should be skipped
+        inputs = ["Input 1", "Very long input 2", "Input 3"]
+        outputs = [
+            SampleOutput(name="Test1", value=1),
+            SampleOutput(name="Test2", value=2),
+            SampleOutput(name="Test3", value=3),
+        ]
+
+        # Tokenize - should skip middle example
+        input_ids, attention_mask, labels, token_type_ids = (
+            model._tokenize_for_training(inputs, outputs, mock_tokenizer)
+        )
+
+        # Should have 2 examples (skipped the middle one)
+        assert input_ids.shape[0] == 2
+        assert labels.shape[0] == 2

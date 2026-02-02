@@ -345,9 +345,14 @@ class HuggingfaceModel(Generic[T]):
         outputs: Sequence[T],
         tokenizer: PreTrainedTokenizerBase,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Tokenize inputs and outputs for training with masked labels."""
+        """Tokenize inputs and outputs for training with masked labels.
+
+        Only trains on the assistant response tokens - prompt tokens are masked.
+        Skips examples where the prompt alone exceeds max_seq_length.
+        """
         all_input_ids: list[list[int]] = []
         all_labels: list[list[int]] = []
+        skipped_count = 0
 
         for input_text, output in zip(inputs, outputs, strict=True):
             output_json = output.model_dump_json()
@@ -355,37 +360,76 @@ class HuggingfaceModel(Generic[T]):
             # Build full conversation
             full_messages = self._build_chat_messages(input_text, output_json)
 
-            # Tokenize full conversation
+            # Tokenize full conversation WITHOUT truncation
             full_text = self._apply_chat_template(
                 tokenizer, full_messages, add_generation_prompt=False
             )
             full_encoding = tokenizer(
                 full_text,
-                truncation=True,
-                max_length=self.max_seq_length,
+                truncation=False,
                 return_tensors=None,
             )
 
-            # Tokenize without the assistant response to find the boundary
+            # Tokenize prompt WITHOUT truncation to find the boundary
             prompt_messages = self._build_chat_messages(input_text, None)
             prompt_text = self._apply_chat_template(
                 tokenizer, prompt_messages, add_generation_prompt=True
             )
             prompt_encoding = tokenizer(
                 prompt_text,
-                truncation=True,
-                max_length=self.max_seq_length,
+                truncation=False,
                 return_tensors=None,
             )
 
-            # Create labels: -100 for prompt tokens, actual ids for output tokens
-            input_ids: list[int] = full_encoding["input_ids"]  # type: ignore[assignment]
-            prompt_length = len(prompt_encoding["input_ids"])  # type: ignore[arg-type]
+            # Find where token sequences diverge
+            full_tokens: list[int] = full_encoding["input_ids"]  # type: ignore[assignment]
+            prompt_tokens: list[int] = prompt_encoding["input_ids"]  # type: ignore[assignment]
 
-            labels: list[int] = [-100] * prompt_length + input_ids[prompt_length:]
+            divergence_idx = 0
+            for i in range(min(len(full_tokens), len(prompt_tokens))):
+                if full_tokens[i] != prompt_tokens[i]:
+                    break
+                divergence_idx = i + 1
+
+            # Skip examples where prompt alone is too long
+            if divergence_idx >= self.max_seq_length:
+                skipped_count += 1
+                print(
+                    f"WARNING: Skipping example {skipped_count}: "
+                    f"prompt length ({divergence_idx}) exceeds "
+                    f"max_seq_length ({self.max_seq_length})"
+                )
+                continue
+
+            # Apply truncation to full conversation
+            if len(full_tokens) > self.max_seq_length:
+                input_ids = full_tokens[: self.max_seq_length]
+            else:
+                input_ids = full_tokens
+
+            # Create labels: mask prompt, keep response (up to max_length)
+            labels = ([-100] * divergence_idx + input_ids[divergence_idx:])[
+                : self.max_seq_length
+            ]
 
             all_input_ids.append(input_ids)
             all_labels.append(labels)
+
+        if skipped_count > 0:
+            print(
+                f"WARNING: Skipped {skipped_count} example(s) due to prompt length "
+                f"exceeding max_seq_length. Consider increasing max_seq_length or "
+                f"using shorter prompts."
+            )
+
+        # Check if all examples were skipped
+        if not all_input_ids:
+            msg = (
+                "All training examples were skipped because prompts exceed "
+                f"max_seq_length ({self.max_seq_length}). "
+                "Increase max_seq_length or use shorter prompts."
+            )
+            raise ValueError(msg)
 
         # Pad to same length
         max_len = max(len(ids) for ids in all_input_ids)
