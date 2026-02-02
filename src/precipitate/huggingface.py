@@ -167,7 +167,7 @@ class HuggingfaceModel(Generic[T]):
         # Training hyperparameters
         learning_rate: float = 5e-5,
         num_epochs: int = 3,
-        batch_size: int = 8,
+        batch_size: int = 4,
         gradient_accumulation_steps: int = 1,
         warmup_ratio: float = 0.1,
         weight_decay: float = 0.01,
@@ -178,6 +178,12 @@ class HuggingfaceModel(Generic[T]):
         # Distillation parameters
         distillation_temperature: float = 2.0,
         distillation_alpha: float = 0.5,
+        # Memory optimization parameters
+        use_gradient_checkpointing: bool = True,
+        use_8bit_optimizer: bool = False,
+        optimizer_type: str = "adamw_torch_fused",
+        max_grad_norm: float = 1.0,
+        per_device_eval_batch_size: int | None = None,
         # Device configuration
         device: str | None = None,
         # Output directory for checkpoints
@@ -203,6 +209,15 @@ class HuggingfaceModel(Generic[T]):
         # Distillation parameters
         self.distillation_temperature = distillation_temperature
         self.distillation_alpha = distillation_alpha
+
+        # Memory optimization parameters
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.use_8bit_optimizer = use_8bit_optimizer
+        self.optimizer_type = optimizer_type
+        self.max_grad_norm = max_grad_norm
+        self.per_device_eval_batch_size = (
+            per_device_eval_batch_size if per_device_eval_batch_size is not None else batch_size * 2
+        )
 
         # Device configuration
         self._device_name = device
@@ -248,6 +263,10 @@ class HuggingfaceModel(Generic[T]):
             )
             model.to(device)  # type: ignore[arg-type]
             self._model = cast(PreTrainedModel, model)
+
+            # Enable gradient checkpointing for memory efficiency
+            if self.use_gradient_checkpointing:
+                self._model.gradient_checkpointing_enable()
 
             # Ensure pad token is set
             tok = cast(PreTrainedTokenizerBase, self._tokenizer)
@@ -383,19 +402,26 @@ class HuggingfaceModel(Generic[T]):
         total_steps = num_update_steps_per_epoch * self.num_epochs
         warmup_steps = int(self.warmup_ratio * total_steps)
 
+        # Determine optimizer for memory efficiency
+        optim = "paged_adamw_8bit" if self.use_8bit_optimizer else self.optimizer_type
+
         # Configure training
         training_args = TrainingArguments(
             output_dir=self.output_dir,
             num_train_epochs=self.num_epochs,
             per_device_train_batch_size=self.batch_size,
+            per_device_eval_batch_size=self.per_device_eval_batch_size,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             learning_rate=self.learning_rate,
             warmup_steps=warmup_steps,
             weight_decay=self.weight_decay,
+            max_grad_norm=self.max_grad_norm,
             logging_steps=10,
             save_strategy="epoch",
             bf16=self._get_device().type == "cuda",
             dataloader_pin_memory=False,  # For MPS compatibility
+            optim=optim,
+            gradient_checkpointing=self.use_gradient_checkpointing,
         )
 
         # Train
@@ -518,19 +544,26 @@ class HuggingfaceModel(Generic[T]):
         total_steps = num_update_steps_per_epoch * student.num_epochs
         warmup_steps = int(student.warmup_ratio * total_steps)
 
+        # Determine optimizer for memory efficiency
+        optim = "paged_adamw_8bit" if student.use_8bit_optimizer else student.optimizer_type
+
         # Configure training
         training_args = TrainingArguments(
             output_dir=student.output_dir,
             num_train_epochs=student.num_epochs,
             per_device_train_batch_size=student.batch_size,
+            per_device_eval_batch_size=student.per_device_eval_batch_size,
             gradient_accumulation_steps=student.gradient_accumulation_steps,
             learning_rate=student.learning_rate,
             warmup_steps=warmup_steps,
             weight_decay=student.weight_decay,
+            max_grad_norm=student.max_grad_norm,
             logging_steps=10,
             save_strategy="epoch",
             bf16=student._get_device().type == "cuda",
             dataloader_pin_memory=False,  # For MPS compatibility
+            optim=optim,
+            gradient_checkpointing=student.use_gradient_checkpointing,
             remove_unused_columns=False,
         )
 

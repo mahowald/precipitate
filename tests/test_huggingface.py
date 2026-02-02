@@ -124,7 +124,7 @@ class TestHuggingFaceModelInit:
         assert model.system_prompt is None
         assert model.learning_rate == 5e-5
         assert model.num_epochs == 3
-        assert model.batch_size == 8
+        assert model.batch_size == 4
         assert model.gradient_accumulation_steps == 1
         assert model.warmup_ratio == 0.1
         assert model.weight_decay == 0.01
@@ -134,6 +134,12 @@ class TestHuggingFaceModelInit:
         assert model.distillation_temperature == 2.0
         assert model.distillation_alpha == 0.5
         assert model.output_dir == "./hf_model_output"
+        # Memory optimization defaults
+        assert model.use_gradient_checkpointing is True
+        assert model.use_8bit_optimizer is False
+        assert model.optimizer_type == "adamw_torch_fused"
+        assert model.max_grad_norm == 1.0
+        assert model.per_device_eval_batch_size == 8  # batch_size * 2
 
     def test_lazy_loading(self, sample_output_type: type[SampleOutput]) -> None:
         """Test that model/tokenizer are None until first use."""

@@ -32,6 +32,9 @@ demo = [
     "seaborn>=0.13.2",
     "tqdm>=4.67.2",
 ]
+memory-optimizations = [
+    "bitsandbytes>=0.41.0",
+]
 
 [tool.ruff]
 fix = true
