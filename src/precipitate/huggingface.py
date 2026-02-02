@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import importlib
+import json
 import re
-from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
+import tarfile
+import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, BinaryIO, Generic, TypeVar, cast
 
 import torch
 import torch.nn.functional as F
@@ -164,43 +169,18 @@ class HuggingfaceModel(Generic[T]):
         *,
         # Prompt configuration
         system_prompt: str | None = None,
-        # Training hyperparameters
-        learning_rate: float = 5e-5,
-        num_epochs: int = 3,
-        batch_size: int = 4,
-        gradient_accumulation_steps: int = 1,
-        warmup_ratio: float = 0.1,
-        weight_decay: float = 0.01,
-        max_seq_length: int = 2048,
         # Generation parameters
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         # Distillation parameters
         distillation_temperature: float = 2.0,
         distillation_alpha: float = 0.5,
-        # Memory optimization parameters
-        use_gradient_checkpointing: bool = True,
-        use_8bit_optimizer: bool = False,
-        optimizer_type: str = "adamw_torch_fused",
-        max_grad_norm: float = 1.0,
-        per_device_eval_batch_size: int | None = None,
         # Device configuration
         device: str | None = None,
-        # Output directory for checkpoints
-        output_dir: str = "./hf_model_output",
     ) -> None:
         self.model_name = model_name
         self.output_type = output_type
         self.system_prompt = system_prompt
-
-        # Training hyperparameters
-        self.learning_rate = learning_rate
-        self.num_epochs = num_epochs
-        self.batch_size = batch_size
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.warmup_ratio = warmup_ratio
-        self.weight_decay = weight_decay
-        self.max_seq_length = max_seq_length
 
         # Generation parameters
         self.max_new_tokens = max_new_tokens
@@ -210,21 +190,9 @@ class HuggingfaceModel(Generic[T]):
         self.distillation_temperature = distillation_temperature
         self.distillation_alpha = distillation_alpha
 
-        # Memory optimization parameters
-        self.use_gradient_checkpointing = use_gradient_checkpointing
-        self.use_8bit_optimizer = use_8bit_optimizer
-        self.optimizer_type = optimizer_type
-        self.max_grad_norm = max_grad_norm
-        self.per_device_eval_batch_size = (
-            per_device_eval_batch_size if per_device_eval_batch_size is not None else batch_size * 2
-        )
-
         # Device configuration
         self._device_name = device
         self._device: torch.device | None = None
-
-        # Output directory
-        self.output_dir = output_dir
 
         # Lazily loaded model and tokenizer
         self._tokenizer: PreTrainedTokenizerBase | None = None
@@ -263,10 +231,6 @@ class HuggingfaceModel(Generic[T]):
             )
             model.to(device)  # type: ignore[arg-type]
             self._model = cast(PreTrainedModel, model)
-
-            # Enable gradient checkpointing for memory efficiency
-            if self.use_gradient_checkpointing:
-                self._model.gradient_checkpointing_enable()
 
             # Ensure pad token is set
             tok = cast(PreTrainedTokenizerBase, self._tokenizer)
@@ -344,6 +308,7 @@ class HuggingfaceModel(Generic[T]):
         inputs: Sequence[str],
         outputs: Sequence[T],
         tokenizer: PreTrainedTokenizerBase,
+        max_seq_length: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Tokenize inputs and outputs for training with masked labels.
 
@@ -392,24 +357,24 @@ class HuggingfaceModel(Generic[T]):
                 divergence_idx = i + 1
 
             # Skip examples where prompt alone is too long
-            if divergence_idx >= self.max_seq_length:
+            if divergence_idx >= max_seq_length:
                 skipped_count += 1
                 print(
                     f"WARNING: Skipping example {skipped_count}: "
                     f"prompt length ({divergence_idx}) exceeds "
-                    f"max_seq_length ({self.max_seq_length})"
+                    f"max_seq_length ({max_seq_length})"
                 )
                 continue
 
             # Apply truncation to full conversation
-            if len(full_tokens) > self.max_seq_length:
-                input_ids = full_tokens[: self.max_seq_length]
+            if len(full_tokens) > max_seq_length:
+                input_ids = full_tokens[:max_seq_length]
             else:
                 input_ids = full_tokens
 
             # Create labels: mask prompt, keep response (up to max_length)
             labels = ([-100] * divergence_idx + input_ids[divergence_idx:])[
-                : self.max_seq_length
+                :max_seq_length
             ]
 
             all_input_ids.append(input_ids)
@@ -426,7 +391,7 @@ class HuggingfaceModel(Generic[T]):
         if not all_input_ids:
             msg = (
                 "All training examples were skipped because prompts exceed "
-                f"max_seq_length ({self.max_seq_length}). "
+                f"max_seq_length ({max_seq_length}). "
                 "Increase max_seq_length or use shorter prompts."
             )
             raise ValueError(msg)
@@ -455,10 +420,45 @@ class HuggingfaceModel(Generic[T]):
             torch.tensor(padded_token_type_ids),
         )
 
-    def fit(self, inputs: list[str], outputs: list[T]) -> None:
+    def fit(
+        self,
+        inputs: list[str],
+        outputs: list[T],
+        *,
+        learning_rate: float = 5e-5,
+        num_epochs: int = 3,
+        batch_size: int = 4,
+        gradient_accumulation_steps: int = 1,
+        warmup_ratio: float = 0.1,
+        weight_decay: float = 0.01,
+        max_seq_length: int = 2048,
+        use_gradient_checkpointing: bool = True,
+        use_8bit_optimizer: bool = False,
+        optimizer_type: str = "adamw_torch_fused",
+        max_grad_norm: float = 1.0,
+        per_device_eval_batch_size: int | None = None,
+        output_dir: str = "./hf_model_output",
+    ) -> None:
         """Fine-tune the model on input-output pairs.
 
         Training uses masked loss - only the output JSON tokens contribute to the loss.
+
+        Args:
+            inputs: List of input strings
+            outputs: List of Pydantic model instances representing expected outputs
+            learning_rate: Learning rate for training
+            num_epochs: Number of training epochs
+            batch_size: Training batch size
+            gradient_accumulation_steps: Number of steps to accumulate gradients
+            warmup_ratio: Ratio of total steps for learning rate warmup
+            weight_decay: Weight decay for regularization
+            max_seq_length: Maximum sequence length for tokenization
+            use_gradient_checkpointing: Enable gradient checkpointing for memory efficiency
+            use_8bit_optimizer: Use 8-bit Adam optimizer (requires bitsandbytes)
+            optimizer_type: Optimizer type to use
+            max_grad_norm: Maximum gradient norm for clipping
+            per_device_eval_batch_size: Eval batch size (defaults to batch_size * 2)
+            output_dir: Directory for saving checkpoints
         """
         if len(inputs) != len(outputs):
             msg = "inputs and outputs must have same length"
@@ -466,9 +466,13 @@ class HuggingfaceModel(Generic[T]):
 
         model, tokenizer = self._load_model_and_tokenizer()
 
+        # Enable gradient checkpointing if requested
+        if use_gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+
         # Tokenize with masked labels
         input_ids, attention_mask, labels, token_type_ids = self._tokenize_for_training(
-            inputs, outputs, tokenizer
+            inputs, outputs, tokenizer, max_seq_length
         )
 
         # Create dataset
@@ -480,33 +484,40 @@ class HuggingfaceModel(Generic[T]):
         )
 
         # Calculate warmup_steps from warmup_ratio with gradient accumulation
-        effective_batch_size = self.batch_size * self.gradient_accumulation_steps
+        effective_batch_size = batch_size * gradient_accumulation_steps
         num_update_steps_per_epoch = max(
             1, (len(dataset) + effective_batch_size - 1) // effective_batch_size
         )
-        total_steps = num_update_steps_per_epoch * self.num_epochs
-        warmup_steps = int(self.warmup_ratio * total_steps)
+        total_steps = num_update_steps_per_epoch * num_epochs
+        warmup_steps = int(warmup_ratio * total_steps)
+
+        # Determine eval batch size
+        eval_batch_size = (
+            per_device_eval_batch_size
+            if per_device_eval_batch_size is not None
+            else batch_size * 2
+        )
 
         # Determine optimizer for memory efficiency
-        optim = "paged_adamw_8bit" if self.use_8bit_optimizer else self.optimizer_type
+        optim = "paged_adamw_8bit" if use_8bit_optimizer else optimizer_type
 
         # Configure training
         training_args = TrainingArguments(
-            output_dir=self.output_dir,
-            num_train_epochs=self.num_epochs,
-            per_device_train_batch_size=self.batch_size,
-            per_device_eval_batch_size=self.per_device_eval_batch_size,
-            gradient_accumulation_steps=self.gradient_accumulation_steps,
-            learning_rate=self.learning_rate,
+            output_dir=output_dir,
+            num_train_epochs=num_epochs,
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=eval_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            learning_rate=learning_rate,
             warmup_steps=warmup_steps,
-            weight_decay=self.weight_decay,
-            max_grad_norm=self.max_grad_norm,
+            weight_decay=weight_decay,
+            max_grad_norm=max_grad_norm,
             logging_steps=10,
             save_strategy="epoch",
             bf16=self._get_device().type == "cuda",
             dataloader_pin_memory=False,  # For MPS compatibility
             optim=optim,
-            gradient_checkpointing=self.use_gradient_checkpointing,
+            gradient_checkpointing=use_gradient_checkpointing,
         )
 
         # Train
@@ -540,7 +551,7 @@ class HuggingfaceModel(Generic[T]):
                 prompt,
                 return_tensors="pt",
                 truncation=True,
-                max_length=self.max_seq_length,
+                max_length=2048,  # Default max length for inference
             )
             device = self._get_device()
             input_ids_tensor: torch.Tensor = encoded["input_ids"].to(device)  # type: ignore[union-attr]
@@ -588,13 +599,48 @@ class HuggingfaceModel(Generic[T]):
         raise ValueError(msg)
 
     def distill(
-        self, student: HuggingfaceModel[T], inputs: list[str], outputs: list[T]
+        self,
+        student: HuggingfaceModel[T],
+        inputs: list[str],
+        outputs: list[T],
+        *,
+        learning_rate: float = 5e-5,
+        num_epochs: int = 3,
+        batch_size: int = 4,
+        gradient_accumulation_steps: int = 1,
+        warmup_ratio: float = 0.1,
+        weight_decay: float = 0.01,
+        max_seq_length: int = 2048,
+        use_gradient_checkpointing: bool = True,
+        use_8bit_optimizer: bool = False,
+        optimizer_type: str = "adamw_torch_fused",
+        max_grad_norm: float = 1.0,
+        per_device_eval_batch_size: int | None = None,
+        output_dir: str = "./hf_model_output",
     ) -> None:
         """Distill knowledge from this model (teacher) to the student model.
 
         Uses KL divergence between teacher and student logits, combined with
         hard label cross-entropy loss. Teacher logits are computed on-the-fly
         during training to minimize memory usage.
+
+        Args:
+            student: Student model to train
+            inputs: List of input strings
+            outputs: List of Pydantic model instances representing expected outputs
+            learning_rate: Learning rate for training
+            num_epochs: Number of training epochs
+            batch_size: Training batch size
+            gradient_accumulation_steps: Number of steps to accumulate gradients
+            warmup_ratio: Ratio of total steps for learning rate warmup
+            weight_decay: Weight decay for regularization
+            max_seq_length: Maximum sequence length for tokenization
+            use_gradient_checkpointing: Enable gradient checkpointing for memory efficiency
+            use_8bit_optimizer: Use 8-bit Adam optimizer (requires bitsandbytes)
+            optimizer_type: Optimizer type to use
+            max_grad_norm: Maximum gradient norm for clipping
+            per_device_eval_batch_size: Eval batch size (defaults to batch_size * 2)
+            output_dir: Directory for saving checkpoints
         """
         if len(inputs) != len(outputs):
             msg = "inputs and outputs must have same length"
@@ -605,9 +651,15 @@ class HuggingfaceModel(Generic[T]):
 
         teacher_model.eval()  # Teacher is frozen
 
+        # Enable gradient checkpointing on student if requested
+        if use_gradient_checkpointing:
+            student_model.gradient_checkpointing_enable()
+
         # Tokenize with student tokenizer
         input_ids, attention_mask, labels, token_type_ids = (
-            student._tokenize_for_training(inputs, outputs, student_tokenizer)
+            student._tokenize_for_training(
+                inputs, outputs, student_tokenizer, max_seq_length
+            )
         )
 
         # Create dataset
@@ -619,33 +671,40 @@ class HuggingfaceModel(Generic[T]):
         )
 
         # Calculate warmup_steps from warmup_ratio with gradient accumulation
-        effective_batch_size = student.batch_size * student.gradient_accumulation_steps
+        effective_batch_size = batch_size * gradient_accumulation_steps
         num_update_steps_per_epoch = max(
             1, (len(dataset) + effective_batch_size - 1) // effective_batch_size
         )
-        total_steps = num_update_steps_per_epoch * student.num_epochs
-        warmup_steps = int(student.warmup_ratio * total_steps)
+        total_steps = num_update_steps_per_epoch * num_epochs
+        warmup_steps = int(warmup_ratio * total_steps)
+
+        # Determine eval batch size
+        eval_batch_size = (
+            per_device_eval_batch_size
+            if per_device_eval_batch_size is not None
+            else batch_size * 2
+        )
 
         # Determine optimizer for memory efficiency
-        optim = "paged_adamw_8bit" if student.use_8bit_optimizer else student.optimizer_type
+        optim = "paged_adamw_8bit" if use_8bit_optimizer else optimizer_type
 
         # Configure training
         training_args = TrainingArguments(
-            output_dir=student.output_dir,
-            num_train_epochs=student.num_epochs,
-            per_device_train_batch_size=student.batch_size,
-            per_device_eval_batch_size=student.per_device_eval_batch_size,
-            gradient_accumulation_steps=student.gradient_accumulation_steps,
-            learning_rate=student.learning_rate,
+            output_dir=output_dir,
+            num_train_epochs=num_epochs,
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=eval_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            learning_rate=learning_rate,
             warmup_steps=warmup_steps,
-            weight_decay=student.weight_decay,
-            max_grad_norm=student.max_grad_norm,
+            weight_decay=weight_decay,
+            max_grad_norm=max_grad_norm,
             logging_steps=10,
             save_strategy="epoch",
             bf16=student._get_device().type == "cuda",
             dataloader_pin_memory=False,  # For MPS compatibility
             optim=optim,
-            gradient_checkpointing=student.use_gradient_checkpointing,
+            gradient_checkpointing=use_gradient_checkpointing,
             remove_unused_columns=False,
         )
 
@@ -660,3 +719,105 @@ class HuggingfaceModel(Generic[T]):
         )
 
         trainer.train()
+
+    def save(self, stream: BinaryIO) -> None:
+        """Save the model, tokenizer, and configuration to a binary stream.
+
+        Args:
+            stream: Binary stream to write the model to
+        """
+        # Load model and tokenizer if not already loaded
+        model, tokenizer = self._load_model_and_tokenizer()
+
+        # Create temporary directory for saving
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            # Save model and tokenizer
+            model_dir = temp_path / "model"
+            tokenizer_dir = temp_path / "tokenizer"
+            model.save_pretrained(str(model_dir))
+            tokenizer.save_pretrained(str(tokenizer_dir))
+
+            # Save configuration
+            config = {
+                "model_name": self.model_name,
+                "output_type": f"{self.output_type.__module__}.{self.output_type.__name__}",
+                "system_prompt": self.system_prompt,
+                "max_new_tokens": self.max_new_tokens,
+                "temperature": self.temperature,
+                "distillation_temperature": self.distillation_temperature,
+                "distillation_alpha": self.distillation_alpha,
+                "device": self._device_name,
+            }
+            config_file = temp_path / "config.json"
+            config_file.write_text(json.dumps(config, indent=2))
+
+            # Create tar archive and write to stream
+            with tarfile.open(fileobj=stream, mode="w:gz") as tar:
+                tar.add(model_dir, arcname="model")
+                tar.add(tokenizer_dir, arcname="tokenizer")
+                tar.add(config_file, arcname="config.json")
+
+    @classmethod
+    def load(cls, stream: BinaryIO) -> HuggingfaceModel[BaseModel]:  # type: ignore[type-arg]
+        """Load a model from a binary stream.
+
+        Args:
+            stream: Binary stream containing the saved model
+
+        Returns:
+            Loaded HuggingfaceModel instance
+        """
+        # Create temporary directory for extraction
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            # Extract tar archive
+            with tarfile.open(fileobj=stream, mode="r:gz") as tar:
+                tar.extractall(temp_path)
+
+            # Load configuration
+            config_file = temp_path / "config.json"
+            config = json.loads(config_file.read_text())
+
+            # Reconstruct output_type class
+            module_name, class_name = config["output_type"].rsplit(".", 1)
+            module = importlib.import_module(module_name)
+            output_type = getattr(module, class_name)
+
+            # Create model instance
+            model = cls(
+                model_name=config["model_name"],
+                output_type=output_type,
+                system_prompt=config.get("system_prompt"),
+                max_new_tokens=config.get("max_new_tokens", 512),
+                temperature=config.get("temperature", 0.7),
+                distillation_temperature=config.get("distillation_temperature", 2.0),
+                distillation_alpha=config.get("distillation_alpha", 0.5),
+                device=config.get("device"),
+            )
+
+            # Load model and tokenizer from saved files
+            model_dir = temp_path / "model"
+            tokenizer_dir = temp_path / "tokenizer"
+
+            loaded_tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir))
+            device = model._get_device()
+            dtype = torch.bfloat16 if device.type != "cpu" else torch.float32
+            loaded_model = AutoModelForCausalLM.from_pretrained(
+                str(model_dir),
+                dtype=dtype,
+            )
+            loaded_model.to(device)  # type: ignore[arg-type]
+
+            # Set loaded model and tokenizer
+            model._model = loaded_model  # type: ignore[assignment]
+            model._tokenizer = loaded_tokenizer
+
+            # Ensure pad token is set
+            if loaded_tokenizer.pad_token is None:
+                loaded_tokenizer.pad_token = loaded_tokenizer.eos_token
+                loaded_model.config.pad_token_id = loaded_tokenizer.pad_token_id
+
+            return model  # type: ignore[return-value]

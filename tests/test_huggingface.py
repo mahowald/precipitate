@@ -100,18 +100,20 @@ class TestHuggingFaceModelInit:
             model_name="test-model",
             output_type=sample_output_type,
             system_prompt="Test prompt",
-            learning_rate=1e-4,
-            num_epochs=5,
-            batch_size=16,
+            max_new_tokens=1024,
+            temperature=0.5,
+            distillation_temperature=3.0,
+            distillation_alpha=0.7,
             device="cpu",
         )
 
         assert model.model_name == "test-model"
         assert model.output_type == sample_output_type
         assert model.system_prompt == "Test prompt"
-        assert model.learning_rate == 1e-4
-        assert model.num_epochs == 5
-        assert model.batch_size == 16
+        assert model.max_new_tokens == 1024
+        assert model.temperature == 0.5
+        assert model.distillation_temperature == 3.0
+        assert model.distillation_alpha == 0.7
         assert model._device_name == "cpu"
 
     def test_init_defaults(self, sample_output_type: type[SampleOutput]) -> None:
@@ -122,24 +124,11 @@ class TestHuggingFaceModelInit:
         )
 
         assert model.system_prompt is None
-        assert model.learning_rate == 5e-5
-        assert model.num_epochs == 3
-        assert model.batch_size == 4
-        assert model.gradient_accumulation_steps == 1
-        assert model.warmup_ratio == 0.1
-        assert model.weight_decay == 0.01
-        assert model.max_seq_length == 2048
         assert model.max_new_tokens == 512
         assert model.temperature == 0.7
         assert model.distillation_temperature == 2.0
         assert model.distillation_alpha == 0.5
-        assert model.output_dir == "./hf_model_output"
-        # Memory optimization defaults
-        assert model.use_gradient_checkpointing is True
-        assert model.use_8bit_optimizer is False
-        assert model.optimizer_type == "adamw_torch_fused"
-        assert model.max_grad_norm == 1.0
-        assert model.per_device_eval_batch_size == 8  # batch_size * 2
+        assert model._device_name is None
 
     def test_lazy_loading(self, sample_output_type: type[SampleOutput]) -> None:
         """Test that model/tokenizer are None until first use."""
@@ -672,7 +661,6 @@ class TestLabelMasking:
         model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
-            max_seq_length=100,
         )
 
         # Create sample data
@@ -680,8 +668,10 @@ class TestLabelMasking:
         outputs = [SampleOutput(name="Test", value=42)]
 
         # Tokenize for training
-        input_ids, attention_mask, labels, token_type_ids = (
-            model._tokenize_for_training(inputs, outputs, mock_tokenizer)
+        input_ids, _, labels, _ = (
+            model._tokenize_for_training(
+                inputs, outputs, mock_tokenizer, max_seq_length=100
+            )
         )
 
         # Verify shapes
@@ -729,7 +719,6 @@ class TestLabelMasking:
         model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
-            max_seq_length=100,
         )
 
         # Create sample data - all examples have prompts that are too long
@@ -738,7 +727,9 @@ class TestLabelMasking:
 
         # This should raise ValueError because all examples are skipped
         with pytest.raises(ValueError, match="All training examples were skipped"):
-            model._tokenize_for_training(inputs, outputs, mock_tokenizer)
+            model._tokenize_for_training(
+                inputs, outputs, mock_tokenizer, max_seq_length=100
+            )
 
     def test_partial_prompt_skipping(
         self, sample_output_type: type[SampleOutput]
@@ -784,7 +775,6 @@ class TestLabelMasking:
         model = HuggingfaceModel(
             model_name="test-model",
             output_type=sample_output_type,
-            max_seq_length=100,
         )
 
         # Create sample data: 3 examples, middle one should be skipped
@@ -796,10 +786,120 @@ class TestLabelMasking:
         ]
 
         # Tokenize - should skip middle example
-        input_ids, attention_mask, labels, token_type_ids = (
-            model._tokenize_for_training(inputs, outputs, mock_tokenizer)
+        input_ids, _, labels, _ = (
+            model._tokenize_for_training(
+                inputs, outputs, mock_tokenizer, max_seq_length=100
+            )
         )
 
         # Should have 2 examples (skipped the middle one)
         assert input_ids.shape[0] == 2
         assert labels.shape[0] == 2
+
+
+# =============================================================================
+# Save/Load Tests
+# =============================================================================
+
+
+class TestSaveLoad:
+    """Tests for model save/load functionality."""
+
+    def test_save_and_load_roundtrip(
+        self,
+        sample_output_type: type[SampleOutput],
+        mock_model: MagicMock,
+        mock_tokenizer: MagicMock,
+    ) -> None:
+        """Test that save and load preserve model configuration."""
+        from io import BytesIO
+        from pathlib import Path
+        from unittest.mock import patch
+
+        # Create a model with specific configuration
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            system_prompt="Test system prompt",
+            max_new_tokens=1024,
+            temperature=0.5,
+            distillation_temperature=3.0,
+            distillation_alpha=0.7,
+            device="cpu",
+        )
+
+        # Mock save_pretrained to create dummy files
+        def mock_save_pretrained(path: str) -> None:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            (Path(path) / "dummy_file.txt").write_text("dummy")
+
+        mock_model.save_pretrained = mock_save_pretrained
+        mock_tokenizer.save_pretrained = mock_save_pretrained
+
+        # Mock the model and tokenizer loading
+        model._model = mock_model
+        model._tokenizer = mock_tokenizer
+
+        # Save to BytesIO
+        stream = BytesIO()
+        model.save(stream)
+
+        # Reset stream position
+        stream.seek(0)
+
+        # Mock AutoTokenizer and AutoModelForCausalLM.from_pretrained for loading
+        with (
+            patch(
+                "precipitate.huggingface.AutoTokenizer.from_pretrained"
+            ) as mock_load_tokenizer,
+            patch(
+                "precipitate.huggingface.AutoModelForCausalLM.from_pretrained"
+            ) as mock_load_model,
+        ):
+            mock_load_tokenizer.return_value = mock_tokenizer
+            mock_load_model.return_value = mock_model
+
+            # Load from stream
+            loaded_model = HuggingfaceModel.load(stream)
+
+            # Verify configuration is preserved
+            assert loaded_model.model_name == "test-model"
+            assert loaded_model.output_type == sample_output_type
+            assert loaded_model.system_prompt == "Test system prompt"
+            assert loaded_model.max_new_tokens == 1024
+            assert loaded_model.temperature == 0.5
+            assert loaded_model.distillation_temperature == 3.0
+            assert loaded_model.distillation_alpha == 0.7
+
+    def test_save_without_loaded_model(
+        self, sample_output_type: type[SampleOutput]
+    ) -> None:
+        """Test that save works even when model hasn't been loaded yet."""
+        from io import BytesIO
+        from pathlib import Path
+        from unittest.mock import patch
+
+        # Create a model without loading it
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+        )
+
+        # Mock save_pretrained to create dummy files
+        def mock_save_pretrained(path: str) -> None:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            (Path(path) / "dummy_file.txt").write_text("dummy")
+
+        # Mock the loading process
+        with patch.object(model, "_load_model_and_tokenizer") as mock_load:
+            mock_model = MagicMock()
+            mock_tokenizer = MagicMock()
+            mock_model.save_pretrained = mock_save_pretrained
+            mock_tokenizer.save_pretrained = mock_save_pretrained
+            mock_load.return_value = (mock_model, mock_tokenizer)
+
+            stream = BytesIO()
+            model.save(stream)
+
+            # Verify that _load_model_and_tokenizer was called
+            mock_load.assert_called_once()
