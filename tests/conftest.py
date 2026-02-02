@@ -49,6 +49,7 @@ def mock_tokenizer() -> MagicMock:
     tokenizer.eos_token = "<eos>"
     tokenizer.pad_token_id = 0
     tokenizer.eos_token_id = 1
+    tokenizer.chat_template = None  # Simulate models without chat templates
 
     def apply_chat_template(
         messages: list[dict[str, str]],

@@ -525,3 +525,92 @@ class TestDistillationTrainer:
             # Should not raise even with all masked labels
             loss = trainer.compute_loss(student_model, inputs)
             assert isinstance(loss, torch.Tensor)
+
+
+# =============================================================================
+# Chat Template Fallback Tests
+# =============================================================================
+
+
+class TestChatTemplateFallback:
+    """Tests for chat template fallback functionality."""
+
+    def test_apply_chat_template_with_template(
+        self, sample_output_type: type[SampleOutput], mock_tokenizer: MagicMock
+    ) -> None:
+        """Test that real template is used when available."""
+        mock_tokenizer.chat_template = "some_template"
+        # Replace the function with a MagicMock so we can control the return value
+        mock_apply = MagicMock(return_value="formatted text")
+        mock_tokenizer.apply_chat_template = mock_apply
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+        )
+
+        messages = [{"role": "user", "content": "Hello"}]
+        result = model._apply_chat_template(mock_tokenizer, messages, False)
+
+        assert result == "formatted text"
+        mock_apply.assert_called_once()
+
+    def test_apply_chat_template_fallback(
+        self, sample_output_type: type[SampleOutput], mock_tokenizer: MagicMock
+    ) -> None:
+        """Test fallback when chat_template is None."""
+        mock_tokenizer.chat_template = None
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            system_prompt="You are helpful",
+        )
+
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Hello"},
+        ]
+        result = model._apply_chat_template(mock_tokenizer, messages, True)
+
+        assert "System: You are helpful" in result
+        assert "User: Hello" in result
+        assert "Assistant: " in result
+
+    def test_fallback_with_output(
+        self, sample_output_type: type[SampleOutput], mock_tokenizer: MagicMock
+    ) -> None:
+        """Test fallback includes assistant output when provided."""
+        mock_tokenizer.chat_template = None
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+        )
+
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": '{"response": "Hi"}'},
+        ]
+        result = model._apply_chat_template(mock_tokenizer, messages, False)
+
+        assert "User: Hello" in result
+        assert 'Assistant: {"response": "Hi"}' in result
+
+    def test_fallback_without_system_prompt(
+        self, sample_output_type: type[SampleOutput], mock_tokenizer: MagicMock
+    ) -> None:
+        """Test fallback works without system prompt."""
+        mock_tokenizer.chat_template = None
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+        )
+
+        messages = [{"role": "user", "content": "Hello"}]
+        result = model._apply_chat_template(mock_tokenizer, messages, True)
+
+        assert "User: Hello" in result
+        assert "Assistant: " in result
+        assert "System:" not in result

@@ -292,6 +292,53 @@ class HuggingfaceModel(Generic[T]):
 
         return messages
 
+    def _apply_chat_template(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        messages: list[dict[str, str]],
+        add_generation_prompt: bool = False,
+    ) -> str:
+        """Apply chat template with fallback for models without templates.
+
+        Args:
+            tokenizer: The tokenizer to use
+            messages: List of message dicts with 'role' and 'content'
+            add_generation_prompt: If True, add assistant generation prompt
+
+        Returns:
+            Formatted text string
+        """
+        # Try to use the model's chat template if available
+        if tokenizer.chat_template is not None:
+            return cast(
+                str,
+                tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=add_generation_prompt,
+                ),
+            )
+
+        # Fallback: construct prompt manually
+        parts = []
+
+        for message in messages:
+            role = message["role"]
+            content = message["content"]
+
+            if role == "system":
+                parts.append(f"System: {content}\n\n")
+            elif role == "user":
+                parts.append(f"User: {content}\n\n")
+            elif role == "assistant":
+                parts.append(f"Assistant: {content}")
+
+        # Add generation prompt if needed
+        if add_generation_prompt:
+            parts.append("Assistant: ")
+
+        return "".join(parts)
+
     def _tokenize_for_training(
         self,
         inputs: Sequence[str],
@@ -309,11 +356,8 @@ class HuggingfaceModel(Generic[T]):
             full_messages = self._build_chat_messages(input_text, output_json)
 
             # Tokenize full conversation
-            full_text = cast(
-                str,
-                tokenizer.apply_chat_template(
-                    full_messages, tokenize=False, add_generation_prompt=False
-                ),
+            full_text = self._apply_chat_template(
+                tokenizer, full_messages, add_generation_prompt=False
             )
             full_encoding = tokenizer(
                 full_text,
@@ -324,11 +368,8 @@ class HuggingfaceModel(Generic[T]):
 
             # Tokenize without the assistant response to find the boundary
             prompt_messages = self._build_chat_messages(input_text, None)
-            prompt_text = cast(
-                str,
-                tokenizer.apply_chat_template(
-                    prompt_messages, tokenize=False, add_generation_prompt=True
-                ),
+            prompt_text = self._apply_chat_template(
+                tokenizer, prompt_messages, add_generation_prompt=True
             )
             prompt_encoding = tokenizer(
                 prompt_text,
@@ -446,11 +487,8 @@ class HuggingfaceModel(Generic[T]):
         for input_text in inputs:
             # Build prompt messages
             messages = self._build_chat_messages(input_text, None)
-            prompt = cast(
-                str,
-                tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                ),
+            prompt = self._apply_chat_template(
+                tokenizer, messages, add_generation_prompt=True
             )
 
             # Tokenize
