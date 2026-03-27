@@ -251,12 +251,12 @@ class HuggingfaceModel(Generic[T]):
             if getattr(config, "is_encoder_decoder", False):
                 model = AutoModelForSeq2SeqLM.from_pretrained(
                     self.model_name,
-                    torch_dtype=dtype,
+                    dtype=dtype,
                 )
             else:
                 model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
-                    torch_dtype=dtype,
+                    dtype=dtype,
                 )
             model.to(device)  # type: ignore[arg-type]
             self._model = cast(PreTrainedModel, model)
@@ -627,6 +627,7 @@ class HuggingfaceModel(Generic[T]):
         # Enable gradient checkpointing if requested
         if use_gradient_checkpointing:
             model.gradient_checkpointing_enable()
+            model.config.use_cache = False  # incompatible with gradient checkpointing
 
         # Tokenize with masked labels
         input_ids, attention_mask, labels, token_type_ids = self._tokenize_for_training(
@@ -693,34 +694,34 @@ class HuggingfaceModel(Generic[T]):
         Uses outlines to guarantee outputs match the Pydantic schema.
         Returns a list of Pydantic model instances parsed from the generated JSON.
         """
-        # Get outlines-wrapped model (cached after first call)
+        return [
+            self.output_type.model_validate_json(s) for s in self.predict_raw(inputs)
+        ]
+
+    def predict_raw(self, inputs: list[str]) -> list[str]:
+        """Generate raw string outputs without schema validation.
+
+        Same as predict() but returns the generated strings directly rather than
+        parsing them into Pydantic instances. Useful for debugging when the model
+        produces truncated or malformed JSON.
+        """
         outlines_model = self._get_outlines_model()
-
-        # Get tokenizer for prompt formatting (already loaded by _get_outlines_model)
         tokenizer = cast(PreTrainedTokenizerBase, self._tokenizer)
-
-        # Create generator with Pydantic schema constraint
         generator = outlines.Generator(outlines_model, self.output_type)
 
-        results: list[T] = []
+        results: list[str] = []
 
         for input_text in inputs:
-            # Build prompt (same as before)
             messages = self._build_chat_messages(input_text, None)
             prompt = self._apply_chat_template(
                 tokenizer, messages, add_generation_prompt=True
             )
-
-            # Generate with constraints
             output_str = generator(
                 prompt,
                 max_new_tokens=self.max_new_tokens,
                 temperature=self.temperature if self.temperature > 0 else None,
             )
-
-            # Parse the guaranteed-valid JSON
-            parsed = self.output_type.model_validate_json(cast(str, output_str))
-            results.append(parsed)
+            results.append(cast(str, output_str))
 
         return results
 
@@ -780,6 +781,7 @@ class HuggingfaceModel(Generic[T]):
         # Enable gradient checkpointing on student if requested
         if use_gradient_checkpointing:
             student_model.gradient_checkpointing_enable()
+            student_model.config.use_cache = False  # incompatible with gradient checkpointing
 
         # Tokenize with student tokenizer
         input_ids, attention_mask, labels, token_type_ids = (
@@ -935,12 +937,12 @@ class HuggingfaceModel(Generic[T]):
             if getattr(saved_config, "is_encoder_decoder", False):
                 loaded_model = AutoModelForSeq2SeqLM.from_pretrained(
                     str(model_dir),
-                    torch_dtype=dtype,
+                    dtype=dtype,
                 )
             else:
                 loaded_model = AutoModelForCausalLM.from_pretrained(
                     str(model_dir),
-                    torch_dtype=dtype,
+                    dtype=dtype,
                 )
             loaded_model.to(device)  # type: ignore[arg-type]
 
