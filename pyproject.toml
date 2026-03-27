@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "onnxruntime>=1.23.2",
+    "outlines>=1.2.9",
     "pydantic>=2.12.5",
     "pytest>=9.0.2",
     "torch>=2.10.0",

@@ -10,12 +10,15 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Generic, TypeVar, cast
 
+import outlines
 import torch
 import torch.nn.functional as F
 from pydantic import BaseModel
 from torch.utils.data import Dataset
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
+    AutoModelForSeq2SeqLM,
     AutoTokenizer,
     PreTrainedModel,
     PreTrainedTokenizerBase,
@@ -117,10 +120,17 @@ class DistillationTrainer(Trainer):  # type: ignore[misc]
             teacher_outputs = self.teacher_model(**inputs)
             teacher_logits = teacher_outputs.logits
 
-        # Shift for causal LM: predict next token
-        shift_student_logits = student_logits[..., :-1, :].contiguous()
-        shift_teacher_logits = teacher_logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
+        # For encoder-decoder models the decoder output logits already align with
+        # labels, so no causal shift is needed.  For decoder-only causal LMs we
+        # shift by one position to predict the next token.
+        if getattr(model.config, "is_encoder_decoder", False):
+            shift_student_logits = student_logits.contiguous()
+            shift_teacher_logits = teacher_logits.contiguous()
+            shift_labels = labels.contiguous()
+        else:
+            shift_student_logits = student_logits[..., :-1, :].contiguous()
+            shift_teacher_logits = teacher_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
 
         # Hard label loss (cross-entropy on non-masked positions)
         hard_loss = F.cross_entropy(
@@ -197,6 +207,7 @@ class HuggingfaceModel(Generic[T]):
         # Lazily loaded model and tokenizer
         self._tokenizer: PreTrainedTokenizerBase | None = None
         self._model: PreTrainedModel | None = None
+        self._outlines_model: Any | None = None
 
     def _get_device(self) -> torch.device:
         """Auto-detect best available device."""
@@ -214,6 +225,17 @@ class HuggingfaceModel(Generic[T]):
 
         return self._device
 
+    def _is_seq2seq(self) -> bool:
+        """Return True if the loaded model is an encoder-decoder (seq2seq) model.
+
+        Only reliable after _load_model_and_tokenizer() has been called.
+        fit() and distill() always load the model before tokenizing, so this
+        will always return the correct value in those code paths.
+        """
+        if self._model is not None:
+            return bool(getattr(self._model.config, "is_encoder_decoder", False))
+        return False
+
     def _load_model_and_tokenizer(
         self,
     ) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
@@ -225,20 +247,37 @@ class HuggingfaceModel(Generic[T]):
             # Use bfloat16 for GPU, float32 for CPU
             dtype = torch.bfloat16 if device.type != "cpu" else torch.float32
 
-            model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                dtype=dtype,
-            )
+            config = AutoConfig.from_pretrained(self.model_name)
+            if getattr(config, "is_encoder_decoder", False):
+                model = AutoModelForSeq2SeqLM.from_pretrained(
+                    self.model_name,
+                    torch_dtype=dtype,
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    torch_dtype=dtype,
+                )
             model.to(device)  # type: ignore[arg-type]
             self._model = cast(PreTrainedModel, model)
 
-            # Ensure pad token is set
+            # Ensure pad token is set (T5-family models already have a pad token)
             tok = cast(PreTrainedTokenizerBase, self._tokenizer)
             if tok.pad_token is None:
                 tok.pad_token = tok.eos_token
                 self._model.config.pad_token_id = tok.pad_token_id
 
         return self._model, cast(PreTrainedTokenizerBase, self._tokenizer)
+
+    def _get_outlines_model(self) -> Any:
+        """Get or create the outlines-wrapped model for constrained generation."""
+        if self._outlines_model is None:
+            model, tokenizer = self._load_model_and_tokenizer()
+            self._outlines_model = outlines.from_transformers(
+                model=model,
+                tokenizer_or_processor=tokenizer,  # type: ignore[arg-type]
+            )
+        return self._outlines_model
 
     def _build_chat_messages(
         self, input_text: str, output_json: str | None = None
@@ -311,6 +350,31 @@ class HuggingfaceModel(Generic[T]):
         max_seq_length: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Tokenize inputs and outputs for training with masked labels.
+
+        For decoder-only models: packs prompt+response into one sequence and masks
+        the prompt tokens so only the response contributes to the loss.
+
+        For encoder-decoder (seq2seq) models: tokenizes the prompt as encoder input
+        and the response JSON as decoder labels separately.
+
+        Skips examples where the encoder input alone exceeds max_seq_length.
+        """
+        if self._is_seq2seq():
+            return self._tokenize_for_training_seq2seq(
+                inputs, outputs, tokenizer, max_seq_length
+            )
+        return self._tokenize_for_training_causal(
+            inputs, outputs, tokenizer, max_seq_length
+        )
+
+    def _tokenize_for_training_causal(
+        self,
+        inputs: Sequence[str],
+        outputs: Sequence[T],
+        tokenizer: PreTrainedTokenizerBase,
+        max_seq_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Tokenize for decoder-only (causal LM) models.
 
         Only trains on the assistant response tokens - prompt tokens are masked.
         Skips examples where the prompt alone exceeds max_seq_length.
@@ -412,6 +476,100 @@ class HuggingfaceModel(Generic[T]):
             padded_labels.append(lbls + [-100] * padding_length)
             # Generate token_type_ids as all 0s (for text-only fine-tuning)
             padded_token_type_ids.append([0] * max_len)
+
+        return (
+            torch.tensor(padded_input_ids),
+            torch.tensor(padded_attention_mask),
+            torch.tensor(padded_labels),
+            torch.tensor(padded_token_type_ids),
+        )
+
+    def _tokenize_for_training_seq2seq(
+        self,
+        inputs: Sequence[str],
+        outputs: Sequence[T],
+        tokenizer: PreTrainedTokenizerBase,
+        max_seq_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Tokenize for encoder-decoder (seq2seq) models such as T5/T5Gemma-2.
+
+        The encoder receives the user prompt; the decoder is trained on the JSON
+        output.  Input and output are tokenized separately — no divergence-point
+        search is needed.  Examples where the encoder input exceeds max_seq_length
+        are skipped.
+        """
+        all_input_ids: list[list[int]] = []
+        all_labels: list[list[int]] = []
+        skipped_count = 0
+        pad_token_id = tokenizer.pad_token_id or 0
+
+        for input_text, output in zip(inputs, outputs, strict=True):
+            # Build encoder input (prompt only)
+            prompt_messages = self._build_chat_messages(input_text, None)
+            prompt_text = self._apply_chat_template(
+                tokenizer, prompt_messages, add_generation_prompt=False
+            )
+            prompt_encoding = tokenizer(
+                prompt_text,
+                truncation=False,
+                return_tensors=None,
+            )
+            prompt_tokens: list[int] = prompt_encoding["input_ids"]  # type: ignore[assignment]
+
+            if len(prompt_tokens) > max_seq_length:
+                skipped_count += 1
+                print(
+                    f"WARNING: Skipping example {skipped_count}: "
+                    f"encoder input length ({len(prompt_tokens)}) exceeds "
+                    f"max_seq_length ({max_seq_length})"
+                )
+                continue
+
+            # Tokenize JSON output (decoder labels)
+            output_json = output.model_dump_json()
+            label_encoding = tokenizer(
+                output_json,
+                truncation=True,
+                max_length=max_seq_length,
+                return_tensors=None,
+            )
+            label_tokens: list[int] = label_encoding["input_ids"]  # type: ignore[assignment]
+
+            all_input_ids.append(prompt_tokens)
+            all_labels.append(label_tokens)
+
+        if skipped_count > 0:
+            print(
+                f"WARNING: Skipped {skipped_count} example(s) due to encoder input "
+                f"exceeding max_seq_length. Consider increasing max_seq_length or "
+                f"using shorter prompts."
+            )
+
+        if not all_input_ids:
+            msg = (
+                "All training examples were skipped because encoder inputs exceed "
+                f"max_seq_length ({max_seq_length}). "
+                "Increase max_seq_length or use shorter prompts."
+            )
+            raise ValueError(msg)
+
+        # Pad encoder inputs to same length
+        max_enc_len = max(len(ids) for ids in all_input_ids)
+        # Pad decoder labels to same length (use -100 so padding is ignored in loss)
+        max_dec_len = max(len(lbls) for lbls in all_labels)
+
+        padded_input_ids: list[list[int]] = []
+        padded_attention_mask: list[list[int]] = []
+        padded_labels: list[list[int]] = []
+        padded_token_type_ids: list[list[int]] = []
+
+        for ids, lbls in zip(all_input_ids, all_labels, strict=True):
+            enc_pad = max_enc_len - len(ids)
+            dec_pad = max_dec_len - len(lbls)
+            padded_input_ids.append(ids + [pad_token_id] * enc_pad)  # type: ignore[arg-type]
+            padded_attention_mask.append([1] * len(ids) + [0] * enc_pad)
+            padded_labels.append(lbls + [-100] * dec_pad)
+            padded_token_type_ids.append([0] * max_enc_len)
 
         return (
             torch.tensor(padded_input_ids),
@@ -530,73 +688,41 @@ class HuggingfaceModel(Generic[T]):
         trainer.train()
 
     def predict(self, inputs: list[str]) -> list[T]:
-        """Generate predictions for the given inputs.
+        """Generate predictions with constrained generation.
 
+        Uses outlines to guarantee outputs match the Pydantic schema.
         Returns a list of Pydantic model instances parsed from the generated JSON.
         """
-        model, tokenizer = self._load_model_and_tokenizer()
-        model.eval()
+        # Get outlines-wrapped model (cached after first call)
+        outlines_model = self._get_outlines_model()
+
+        # Get tokenizer for prompt formatting (already loaded by _get_outlines_model)
+        tokenizer = cast(PreTrainedTokenizerBase, self._tokenizer)
+
+        # Create generator with Pydantic schema constraint
+        generator = outlines.Generator(outlines_model, self.output_type)
 
         results: list[T] = []
 
         for input_text in inputs:
-            # Build prompt messages
+            # Build prompt (same as before)
             messages = self._build_chat_messages(input_text, None)
             prompt = self._apply_chat_template(
                 tokenizer, messages, add_generation_prompt=True
             )
 
-            # Tokenize
-            encoded = tokenizer(
+            # Generate with constraints
+            output_str = generator(
                 prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=2048,  # Default max length for inference
+                max_tokens=self.max_new_tokens,
+                temperature=self.temperature if self.temperature > 0 else None,
             )
-            device = self._get_device()
-            input_ids_tensor: torch.Tensor = encoded["input_ids"].to(device)  # type: ignore[union-attr]
-            attention_mask_tensor: torch.Tensor = encoded["attention_mask"].to(device)  # type: ignore[union-attr]
 
-            # Generate
-            with torch.no_grad():
-                generated = model.generate(  # type: ignore[operator]
-                    input_ids=input_ids_tensor,
-                    attention_mask=attention_mask_tensor,
-                    max_new_tokens=self.max_new_tokens,
-                    temperature=self.temperature if self.temperature > 0 else None,
-                    do_sample=self.temperature > 0,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-
-            # Decode only the new tokens
-            input_length = input_ids_tensor.shape[1]
-            new_tokens = generated[0, input_length:]
-            output_text = str(tokenizer.decode(new_tokens, skip_special_tokens=True))
-
-            # Parse as Pydantic model
-            try:
-                parsed = self.output_type.model_validate_json(output_text)
-            except Exception:
-                # Try to extract JSON from the output
-                parsed = self._extract_and_parse_json(output_text)
-
+            # Parse the guaranteed-valid JSON
+            parsed = self.output_type.model_validate_json(cast(str, output_str))
             results.append(parsed)
 
         return results
-
-    def _extract_and_parse_json(self, text: str) -> T:
-        """Attempt to extract and parse JSON from text that may have extra content."""
-        # Try to find JSON object in the text
-        json_match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
-        if json_match:
-            try:
-                return self.output_type.model_validate_json(json_match.group())
-            except Exception:
-                pass
-
-        msg = f"Could not parse output as {self.output_type.__name__}: {text}"
-        raise ValueError(msg)
 
     def distill(
         self,
@@ -805,10 +931,17 @@ class HuggingfaceModel(Generic[T]):
             loaded_tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir))
             device = model._get_device()
             dtype = torch.bfloat16 if device.type != "cpu" else torch.float32
-            loaded_model = AutoModelForCausalLM.from_pretrained(
-                str(model_dir),
-                dtype=dtype,
-            )
+            saved_config = AutoConfig.from_pretrained(str(model_dir))
+            if getattr(saved_config, "is_encoder_decoder", False):
+                loaded_model = AutoModelForSeq2SeqLM.from_pretrained(
+                    str(model_dir),
+                    torch_dtype=dtype,
+                )
+            else:
+                loaded_model = AutoModelForCausalLM.from_pretrained(
+                    str(model_dir),
+                    torch_dtype=dtype,
+                )
             loaded_model.to(device)  # type: ignore[arg-type]
 
             # Set loaded model and tokenizer

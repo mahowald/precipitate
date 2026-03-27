@@ -244,59 +244,6 @@ class TestBuildChatMessages:
 # =============================================================================
 
 
-class TestExtractAndParseJson:
-    """Tests for _extract_and_parse_json."""
-
-    def test_clean_json(self, sample_output_type: type[SampleOutput]) -> None:
-        """Test parsing clean JSON."""
-        model = HuggingfaceModel(
-            model_name="test-model",
-            output_type=sample_output_type,
-        )
-
-        result = model._extract_and_parse_json('{"name": "Alice", "value": 42}')
-        assert result.name == "Alice"
-        assert result.value == 42
-
-    def test_json_with_prefix(self, sample_output_type: type[SampleOutput]) -> None:
-        """Test extracting JSON with text before it."""
-        model = HuggingfaceModel(
-            model_name="test-model",
-            output_type=sample_output_type,
-        )
-
-        result = model._extract_and_parse_json(
-            'Here is the result: {"name": "Bob", "value": 17}'
-        )
-        assert result.name == "Bob"
-        assert result.value == 17
-
-    def test_json_with_suffix(self, sample_output_type: type[SampleOutput]) -> None:
-        """Test extracting JSON with text after it."""
-        model = HuggingfaceModel(
-            model_name="test-model",
-            output_type=sample_output_type,
-        )
-
-        result = model._extract_and_parse_json(
-            '{"name": "Charlie", "value": 99} Hope that helps!'
-        )
-        assert result.name == "Charlie"
-        assert result.value == 99
-
-    def test_json_extraction_failure(
-        self, sample_output_type: type[SampleOutput]
-    ) -> None:
-        """Test ValueError is raised for invalid JSON."""
-        model = HuggingfaceModel(
-            model_name="test-model",
-            output_type=sample_output_type,
-        )
-
-        with pytest.raises(ValueError, match="Could not parse output"):
-            model._extract_and_parse_json("This has no JSON at all")
-
-
 # =============================================================================
 # Fit Method Tests
 # =============================================================================
@@ -323,12 +270,14 @@ class TestFit:
 
     @patch("precipitate.huggingface.TrainingArguments")
     @patch("precipitate.huggingface.Trainer")
+    @patch("precipitate.huggingface.AutoConfig")
     @patch("precipitate.huggingface.AutoModelForCausalLM")
     @patch("precipitate.huggingface.AutoTokenizer")
     def test_fit_calls_trainer(
         self,
         mock_auto_tokenizer: MagicMock,
         mock_auto_model: MagicMock,
+        mock_auto_config: MagicMock,
         mock_trainer_class: MagicMock,
         mock_training_args: MagicMock,
         sample_output_type: type[SampleOutput],
@@ -340,6 +289,7 @@ class TestFit:
         """Test that Trainer is called correctly during fit."""
         mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
         mock_auto_model.from_pretrained.return_value = mock_model
+        mock_auto_config.from_pretrained.return_value.is_encoder_decoder = False
 
         model = HuggingfaceModel(
             model_name="test-model",
@@ -362,22 +312,32 @@ class TestFit:
 class TestPredict:
     """Tests for the predict method."""
 
+    @patch("precipitate.huggingface.outlines")
+    @patch("precipitate.huggingface.AutoConfig")
     @patch("precipitate.huggingface.AutoModelForCausalLM")
     @patch("precipitate.huggingface.AutoTokenizer")
     def test_predict_returns_parsed_output(
         self,
         mock_auto_tokenizer: MagicMock,
         mock_auto_model: MagicMock,
+        mock_auto_config: MagicMock,
+        mock_outlines: MagicMock,
         sample_output_type: type[SampleOutput],
         mock_tokenizer: MagicMock,
         mock_model: MagicMock,
     ) -> None:
-        """Test that predict returns parsed Pydantic models."""
+        """Test that predict uses outlines and returns parsed Pydantic models."""
         mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
         mock_auto_model.from_pretrained.return_value = mock_model
+        mock_auto_config.from_pretrained.return_value.is_encoder_decoder = False
 
-        # Override decode to return valid JSON
-        mock_tokenizer.decode = lambda x, **kwargs: '{"name": "Test", "value": 123}'
+        # Mock outlines wrapper and generator
+        mock_outlines_wrapper = MagicMock()
+        mock_outlines.from_transformers.return_value = mock_outlines_wrapper
+
+        mock_generator = MagicMock()
+        mock_generator.return_value = '{"name": "Test", "value": 123}'
+        mock_outlines.Generator.return_value = mock_generator
 
         model = HuggingfaceModel(
             model_name="test-model",
@@ -387,10 +347,111 @@ class TestPredict:
 
         results = model.predict(["Test input"])
 
+        # Verify outlines was used
+        mock_outlines.from_transformers.assert_called_once()
+        mock_outlines.Generator.assert_called_once_with(
+            mock_outlines_wrapper, sample_output_type
+        )
+
+        # Verify results
         assert len(results) == 1
         assert isinstance(results[0], SampleOutput)
         assert results[0].name == "Test"
         assert results[0].value == 123
+
+    @patch("precipitate.huggingface.outlines")
+    @patch("precipitate.huggingface.AutoConfig")
+    @patch("precipitate.huggingface.AutoModelForCausalLM")
+    @patch("precipitate.huggingface.AutoTokenizer")
+    def test_predict_caches_outlines_wrapper(
+        self,
+        mock_auto_tokenizer: MagicMock,
+        mock_auto_model: MagicMock,
+        mock_auto_config: MagicMock,
+        mock_outlines: MagicMock,
+        sample_output_type: type[SampleOutput],
+        mock_tokenizer: MagicMock,
+        mock_model: MagicMock,
+    ) -> None:
+        """Test that outlines wrapper is cached across predict calls."""
+        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+        mock_auto_model.from_pretrained.return_value = mock_model
+        mock_auto_config.from_pretrained.return_value.is_encoder_decoder = False
+
+        # Mock outlines wrapper and generator
+        mock_outlines_wrapper = MagicMock()
+        mock_outlines.from_transformers.return_value = mock_outlines_wrapper
+
+        mock_generator = MagicMock()
+        mock_generator.return_value = '{"name": "Test", "value": 123}'
+        mock_outlines.Generator.return_value = mock_generator
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            device="cpu",
+        )
+
+        # First predict call
+        model.predict(["Test input 1"])
+
+        # Second predict call
+        model.predict(["Test input 2"])
+
+        # Verify outlines.from_transformers was only called once (cached)
+        assert mock_outlines.from_transformers.call_count == 1
+
+        # Verify generator was called twice (once per predict call)
+        assert mock_generator.call_count == 2
+
+    @patch("precipitate.huggingface.outlines")
+    @patch("precipitate.huggingface.AutoConfig")
+    @patch("precipitate.huggingface.AutoModelForCausalLM")
+    @patch("precipitate.huggingface.AutoTokenizer")
+    def test_predict_with_multiple_inputs(
+        self,
+        mock_auto_tokenizer: MagicMock,
+        mock_auto_model: MagicMock,
+        mock_auto_config: MagicMock,
+        mock_outlines: MagicMock,
+        sample_output_type: type[SampleOutput],
+        mock_tokenizer: MagicMock,
+        mock_model: MagicMock,
+    ) -> None:
+        """Test that predict handles multiple inputs correctly."""
+        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+        mock_auto_model.from_pretrained.return_value = mock_model
+        mock_auto_config.from_pretrained.return_value.is_encoder_decoder = False
+
+        # Mock outlines wrapper and generator
+        mock_outlines_wrapper = MagicMock()
+        mock_outlines.from_transformers.return_value = mock_outlines_wrapper
+
+        mock_generator = MagicMock()
+        # Return different outputs for each call
+        mock_generator.side_effect = [
+            '{"name": "Alice", "value": 1}',
+            '{"name": "Bob", "value": 2}',
+            '{"name": "Charlie", "value": 3}',
+        ]
+        mock_outlines.Generator.return_value = mock_generator
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            device="cpu",
+        )
+
+        results = model.predict(["Input 1", "Input 2", "Input 3"])
+
+        # Verify all results
+        assert len(results) == 3
+        assert results[0].name == "Alice"
+        assert results[0].value == 1
+        assert results[1].name == "Bob"
+        assert results[1].value == 2
+        assert results[2].name == "Charlie"
+        assert results[2].value == 3
 
 
 # =============================================================================
@@ -668,10 +729,8 @@ class TestLabelMasking:
         outputs = [SampleOutput(name="Test", value=42)]
 
         # Tokenize for training
-        input_ids, _, labels, _ = (
-            model._tokenize_for_training(
-                inputs, outputs, mock_tokenizer, max_seq_length=100
-            )
+        input_ids, _, labels, _ = model._tokenize_for_training(
+            inputs, outputs, mock_tokenizer, max_seq_length=100
         )
 
         # Verify shapes
@@ -786,10 +845,8 @@ class TestLabelMasking:
         ]
 
         # Tokenize - should skip middle example
-        input_ids, _, labels, _ = (
-            model._tokenize_for_training(
-                inputs, outputs, mock_tokenizer, max_seq_length=100
-            )
+        input_ids, _, labels, _ = model._tokenize_for_training(
+            inputs, outputs, mock_tokenizer, max_seq_length=100
         )
 
         # Should have 2 examples (skipped the middle one)
@@ -847,16 +904,20 @@ class TestSaveLoad:
         # Reset stream position
         stream.seek(0)
 
-        # Mock AutoTokenizer and AutoModelForCausalLM.from_pretrained for loading
+        # Mock AutoTokenizer, AutoConfig, and AutoModelForCausalLM.from_pretrained for loading
         with (
             patch(
                 "precipitate.huggingface.AutoTokenizer.from_pretrained"
             ) as mock_load_tokenizer,
             patch(
+                "precipitate.huggingface.AutoConfig.from_pretrained"
+            ) as mock_load_config,
+            patch(
                 "precipitate.huggingface.AutoModelForCausalLM.from_pretrained"
             ) as mock_load_model,
         ):
             mock_load_tokenizer.return_value = mock_tokenizer
+            mock_load_config.return_value.is_encoder_decoder = False
             mock_load_model.return_value = mock_model
 
             # Load from stream
@@ -903,3 +964,219 @@ class TestSaveLoad:
 
             # Verify that _load_model_and_tokenizer was called
             mock_load.assert_called_once()
+
+
+# =============================================================================
+# Seq2Seq / Encoder-Decoder Support Tests
+# =============================================================================
+
+
+class TestSeq2Seq:
+    """Tests for encoder-decoder (T5-style) model support."""
+
+    def test_is_seq2seq_false_when_model_not_loaded(
+        self, sample_output_type: type[SampleOutput]
+    ) -> None:
+        """Test that _is_seq2seq returns False when model not yet loaded."""
+        model = HuggingfaceModel(model_name="test-model", output_type=sample_output_type)
+        assert model._is_seq2seq() is False
+
+    def test_is_seq2seq_false_for_causal_model(
+        self, sample_output_type: type[SampleOutput], mock_model: MagicMock
+    ) -> None:
+        """Test that _is_seq2seq returns False for decoder-only models."""
+        mock_model.config.is_encoder_decoder = False
+        model = HuggingfaceModel(model_name="test-model", output_type=sample_output_type)
+        model._model = mock_model
+        assert model._is_seq2seq() is False
+
+    def test_is_seq2seq_true_for_seq2seq_model(
+        self, sample_output_type: type[SampleOutput], mock_model: MagicMock
+    ) -> None:
+        """Test that _is_seq2seq returns True for encoder-decoder models."""
+        mock_model.config.is_encoder_decoder = True
+        model = HuggingfaceModel(model_name="test-model", output_type=sample_output_type)
+        model._model = mock_model
+        assert model._is_seq2seq() is True
+
+    def test_tokenize_seq2seq_separates_input_and_output(
+        self, sample_output_type: type[SampleOutput], mock_model: MagicMock
+    ) -> None:
+        """Test that seq2seq tokenization produces separate encoder/decoder tensors."""
+        mock_model.config.is_encoder_decoder = True
+
+        # Build a simple mock tokenizer
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+        mock_tokenizer.chat_template = None
+
+        def mock_tokenize(
+            text: str,
+            truncation: bool = False,
+            max_length: int | None = None,
+            return_tensors: str | None = None,
+        ) -> dict[str, list[int]]:
+            # Encoder prompt returns 5 tokens; JSON output returns 3 tokens
+            if text.startswith("{"):
+                tokens = [200, 201, 202]
+            else:
+                tokens = [10, 11, 12, 13, 14]
+            return {"input_ids": tokens, "attention_mask": [1] * len(tokens)}
+
+        mock_tokenizer.side_effect = mock_tokenize
+        mock_tokenizer.__call__ = mock_tokenize
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            device="cpu",
+        )
+        model._model = mock_model
+
+        inputs = ["Hello world"]
+        outputs = [SampleOutput(name="T", value=1)]
+
+        input_ids, attention_mask, labels, token_type_ids = model._tokenize_for_training(
+            inputs, outputs, mock_tokenizer, max_seq_length=512
+        )
+
+        # Encoder input should be 5 tokens
+        assert input_ids.shape == (1, 5)
+        assert attention_mask.shape == (1, 5)
+        # All attention mask values should be 1 (no padding for single example)
+        assert attention_mask[0].tolist() == [1, 1, 1, 1, 1]
+        # Labels should be 3 tokens (the JSON output)
+        assert labels.shape == (1, 3)
+        # Labels should NOT be masked (they are the decoder targets)
+        assert all(v != -100 for v in labels[0].tolist())
+
+    def test_tokenize_seq2seq_pads_correctly(
+        self, sample_output_type: type[SampleOutput], mock_model: MagicMock
+    ) -> None:
+        """Test that seq2seq tokenization pads a batch correctly."""
+        mock_model.config.is_encoder_decoder = True
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+        mock_tokenizer.chat_template = None
+
+        call_count = 0
+
+        def mock_tokenize(
+            text: str,
+            truncation: bool = False,
+            max_length: int | None = None,
+            return_tensors: str | None = None,
+        ) -> dict[str, list[int]]:
+            nonlocal call_count
+            call_count += 1
+            if text.startswith("{"):
+                # JSON outputs: alternate lengths
+                tokens = [200, 201] if call_count % 2 == 0 else [200, 201, 202, 203]
+            else:
+                # Encoder inputs: alternate lengths
+                tokens = [10, 11, 12] if call_count % 2 != 0 else [10, 11, 12, 13, 14]
+            return {"input_ids": tokens, "attention_mask": [1] * len(tokens)}
+
+        mock_tokenizer.side_effect = mock_tokenize
+        mock_tokenizer.__call__ = mock_tokenize
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            device="cpu",
+        )
+        model._model = mock_model
+
+        inputs = ["Short input", "Longer input here"]
+        outputs = [SampleOutput(name="A", value=1), SampleOutput(name="B", value=2)]
+
+        input_ids, attention_mask, labels, _ = model._tokenize_for_training(
+            inputs, outputs, mock_tokenizer, max_seq_length=512
+        )
+
+        # Both examples must have same tensor dimensions
+        assert input_ids.shape[0] == 2
+        assert input_ids.shape[1] == input_ids.shape[1]  # same width
+        assert labels.shape[0] == 2
+        assert labels.shape[1] == labels.shape[1]  # same width
+
+        # Padding positions in encoder input should have attention_mask == 0
+        # Padding positions in labels should be -100
+        for i in range(2):
+            enc_len = attention_mask[i].sum().item()
+            pad_positions = input_ids.shape[1] - int(enc_len)
+            if pad_positions > 0:
+                assert input_ids[i, -pad_positions:].tolist() == [0] * pad_positions
+
+    def test_tokenize_seq2seq_skips_long_encoder_input(
+        self, sample_output_type: type[SampleOutput], mock_model: MagicMock
+    ) -> None:
+        """Test that examples where encoder input exceeds max_seq_length are skipped."""
+        mock_model.config.is_encoder_decoder = True
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+        mock_tokenizer.chat_template = None
+
+        def mock_tokenize(
+            text: str,
+            truncation: bool = False,
+            max_length: int | None = None,
+            return_tensors: str | None = None,
+        ) -> dict[str, list[int]]:
+            if text.startswith("{"):
+                tokens = [200, 201, 202]
+            else:
+                tokens = list(range(200))  # Too long for max_seq_length=100
+            return {"input_ids": tokens, "attention_mask": [1] * len(tokens)}
+
+        mock_tokenizer.side_effect = mock_tokenize
+        mock_tokenizer.__call__ = mock_tokenize
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            device="cpu",
+        )
+        model._model = mock_model
+
+        with pytest.raises(ValueError, match="All training examples were skipped"):
+            model._tokenize_for_training(
+                ["Very long prompt"], [SampleOutput(name="T", value=1)],
+                mock_tokenizer, max_seq_length=100
+            )
+
+    def test_distillation_trainer_seq2seq_no_shift(self) -> None:
+        """Test that DistillationTrainer skips the causal shift for seq2seq models."""
+        teacher_model = MagicMock()
+
+        with patch("precipitate.huggingface.Trainer.__init__", return_value=None):
+            trainer = DistillationTrainer(
+                teacher_model=teacher_model,
+                temperature=2.0,
+                alpha=0.5,
+            )
+
+            batch_size, seq_len, vocab_size = 2, 8, 50
+            inputs = {
+                "input_ids": torch.randint(0, vocab_size, (batch_size, seq_len)),
+                "attention_mask": torch.ones(batch_size, seq_len),
+                "labels": torch.randint(0, vocab_size, (batch_size, seq_len)),
+            }
+            inputs["labels"][:, :3] = -100
+
+            # Mark student model as encoder-decoder
+            student_model = MagicMock()
+            student_model.config.is_encoder_decoder = True
+            student_output = MagicMock()
+            student_output.logits = torch.randn(batch_size, seq_len, vocab_size)
+            student_model.return_value = student_output
+
+            teacher_output = MagicMock()
+            teacher_output.logits = torch.randn(batch_size, seq_len, vocab_size)
+            teacher_model.return_value = teacher_output
+
+            loss = trainer.compute_loss(student_model, inputs)
+            assert isinstance(loss, torch.Tensor)
+            assert loss.dim() == 0
