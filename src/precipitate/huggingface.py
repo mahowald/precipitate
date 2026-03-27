@@ -714,7 +714,7 @@ class HuggingfaceModel(Generic[T]):
             # Generate with constraints
             output_str = generator(
                 prompt,
-                max_tokens=self.max_new_tokens,
+                max_new_tokens=self.max_new_tokens,
                 temperature=self.temperature if self.temperature > 0 else None,
             )
 
