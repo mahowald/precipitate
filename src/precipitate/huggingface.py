@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import json
-import re
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Generic, Literal, TypeVar, cast
 
 import outlines
 import torch
@@ -30,6 +30,22 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 T = TypeVar("T", bound=BaseModel)
+
+
+@dataclasses.dataclass
+class LoraConfig:
+    """Configuration for LoRA (Low-Rank Adaptation) fine-tuning.
+
+    When passed to HuggingfaceModel, only the adapter weights are trained;
+    the base model is frozen. Set target_modules=None to target all linear
+    layers (recommended; peft auto-detects the correct layers per architecture).
+    """
+
+    r: int = 16
+    lora_alpha: int = 32
+    target_modules: list[str] | None = None
+    lora_dropout: float = 0.05
+    bias: Literal["none", "all", "lora_only"] = "none"
 
 
 class StructuredOutputDataset(Dataset[dict[str, torch.Tensor]]):
@@ -185,6 +201,8 @@ class HuggingfaceModel(Generic[T]):
         # Distillation parameters
         distillation_temperature: float = 2.0,
         distillation_alpha: float = 0.5,
+        # LoRA configuration (None = full fine-tuning)
+        lora_config: LoraConfig | None = None,
         # Device configuration
         device: str | None = None,
     ) -> None:
@@ -199,6 +217,9 @@ class HuggingfaceModel(Generic[T]):
         # Distillation parameters
         self.distillation_temperature = distillation_temperature
         self.distillation_alpha = distillation_alpha
+
+        # LoRA configuration
+        self.lora_config = lora_config
 
         # Device configuration
         self._device_name = device
@@ -269,7 +290,7 @@ class HuggingfaceModel(Generic[T]):
 
         return self._model, cast(PreTrainedTokenizerBase, self._tokenizer)
 
-    def _get_outlines_model(self) -> Any:
+    def _get_outlines_model(self) -> Any:  # noqa: ANN401
         """Get or create the outlines-wrapped model for constrained generation."""
         if self._outlines_model is None:
             model, tokenizer = self._load_model_and_tokenizer()
@@ -278,6 +299,32 @@ class HuggingfaceModel(Generic[T]):
                 tokenizer_or_processor=tokenizer,  # type: ignore[arg-type]
             )
         return self._outlines_model
+
+    def _apply_lora(self, model: PreTrainedModel) -> PreTrainedModel:
+        """Wrap a base model with LoRA adapter layers.
+
+        Imports peft lazily so it is only required when LoRA is actually used.
+        Must be called after _load_model_and_tokenizer() so that _is_seq2seq()
+        returns the correct value.
+        """
+        from peft import LoraConfig as PeftLoraConfig  # type: ignore[import-untyped]
+        from peft import (
+            TaskType,  # type: ignore[import-untyped]
+            get_peft_model,  # type: ignore[import-untyped]
+        )
+
+        cfg = self.lora_config
+        assert cfg is not None  # caller guarantees this
+        task_type = TaskType.SEQ_2_SEQ_LM if self._is_seq2seq() else TaskType.CAUSAL_LM
+        peft_cfg = PeftLoraConfig(
+            r=cfg.r,
+            lora_alpha=cfg.lora_alpha,
+            target_modules=cfg.target_modules or "all-linear",
+            lora_dropout=cfg.lora_dropout,
+            bias=cfg.bias,
+            task_type=task_type,
+        )
+        return cast(PreTrainedModel, get_peft_model(model, peft_cfg))
 
     def _build_chat_messages(
         self, input_text: str, output_json: str | None = None
@@ -624,8 +671,18 @@ class HuggingfaceModel(Generic[T]):
 
         model, tokenizer = self._load_model_and_tokenizer()
 
+        # Apply LoRA adapters if configured (freezes base model weights)
+        if self.lora_config is not None:
+            model = self._apply_lora(model)
+            self._model = model
+            self._outlines_model = None  # invalidate outlines cache
+
         # Enable gradient checkpointing if requested
         if use_gradient_checkpointing:
+            if self.lora_config is not None:
+                # PEFT requires this before gradient checkpointing so gradients
+                # flow through the frozen base model to the adapter layers.
+                model.enable_input_require_grads()
             model.gradient_checkpointing_enable()
             model.config.use_cache = False  # incompatible with gradient checkpointing
 
@@ -778,10 +835,20 @@ class HuggingfaceModel(Generic[T]):
 
         teacher_model.eval()  # Teacher is frozen
 
+        # Apply LoRA adapters to student if configured
+        if student.lora_config is not None:
+            student_model = student._apply_lora(student_model)
+            student._model = student_model
+            student._outlines_model = None
+
         # Enable gradient checkpointing on student if requested
         if use_gradient_checkpointing:
+            if student.lora_config is not None:
+                student_model.enable_input_require_grads()
             student_model.gradient_checkpointing_enable()
-            student_model.config.use_cache = False  # incompatible with gradient checkpointing
+            student_model.config.use_cache = (
+                False  # incompatible with gradient checkpointing
+            )
 
         # Tokenize with student tokenizer
         input_ids, attention_mask, labels, token_type_ids = (
@@ -877,6 +944,9 @@ class HuggingfaceModel(Generic[T]):
                 "distillation_temperature": self.distillation_temperature,
                 "distillation_alpha": self.distillation_alpha,
                 "device": self._device_name,
+                "lora_config": dataclasses.asdict(self.lora_config)
+                if self.lora_config
+                else None,
             }
             config_file = temp_path / "config.json"
             config_file.write_text(json.dumps(config, indent=2))
@@ -914,6 +984,10 @@ class HuggingfaceModel(Generic[T]):
             module = importlib.import_module(module_name)
             output_type = getattr(module, class_name)
 
+            # Reconstruct LoRA config if present
+            lora_config_dict = config.get("lora_config")
+            lora_config = LoraConfig(**lora_config_dict) if lora_config_dict else None
+
             # Create model instance
             model = cls(
                 model_name=config["model_name"],
@@ -923,6 +997,7 @@ class HuggingfaceModel(Generic[T]):
                 temperature=config.get("temperature", 0.7),
                 distillation_temperature=config.get("distillation_temperature", 2.0),
                 distillation_alpha=config.get("distillation_alpha", 0.5),
+                lora_config=lora_config,
                 device=config.get("device"),
             )
 
@@ -933,18 +1008,38 @@ class HuggingfaceModel(Generic[T]):
             loaded_tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir))
             device = model._get_device()
             dtype = torch.bfloat16 if device.type != "cpu" else torch.float32
-            saved_config = AutoConfig.from_pretrained(str(model_dir))
-            if getattr(saved_config, "is_encoder_decoder", False):
-                loaded_model = AutoModelForSeq2SeqLM.from_pretrained(
-                    str(model_dir),
-                    dtype=dtype,
-                )
+
+            if lora_config is not None:
+                # For LoRA models: load base model from HuggingFace Hub, then
+                # apply the saved adapter weights on top.
+                from peft import PeftModel  # type: ignore[import-untyped]
+
+                base_config = AutoConfig.from_pretrained(config["model_name"])
+                if getattr(base_config, "is_encoder_decoder", False):
+                    base_model = AutoModelForSeq2SeqLM.from_pretrained(
+                        config["model_name"],
+                        dtype=dtype,
+                    )
+                else:
+                    base_model = AutoModelForCausalLM.from_pretrained(
+                        config["model_name"],
+                        dtype=dtype,
+                    )
+                base_model.to(device)  # type: ignore[arg-type]
+                loaded_model = PeftModel.from_pretrained(base_model, str(model_dir))
             else:
-                loaded_model = AutoModelForCausalLM.from_pretrained(
-                    str(model_dir),
-                    dtype=dtype,
-                )
-            loaded_model.to(device)  # type: ignore[arg-type]
+                saved_config = AutoConfig.from_pretrained(str(model_dir))
+                if getattr(saved_config, "is_encoder_decoder", False):
+                    loaded_model = AutoModelForSeq2SeqLM.from_pretrained(
+                        str(model_dir),
+                        dtype=dtype,
+                    )
+                else:
+                    loaded_model = AutoModelForCausalLM.from_pretrained(
+                        str(model_dir),
+                        dtype=dtype,
+                    )
+                loaded_model.to(device)  # type: ignore[arg-type]
 
             # Set loaded model and tokenizer
             model._model = loaded_model  # type: ignore[assignment]
@@ -953,6 +1048,6 @@ class HuggingfaceModel(Generic[T]):
             # Ensure pad token is set
             if loaded_tokenizer.pad_token is None:
                 loaded_tokenizer.pad_token = loaded_tokenizer.eos_token
-                loaded_model.config.pad_token_id = loaded_tokenizer.pad_token_id
+                loaded_model.config.pad_token_id = loaded_tokenizer.pad_token_id  # type: ignore[union-attr]
 
             return model  # type: ignore[return-value]

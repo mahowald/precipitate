@@ -978,7 +978,9 @@ class TestSeq2Seq:
         self, sample_output_type: type[SampleOutput]
     ) -> None:
         """Test that _is_seq2seq returns False when model not yet loaded."""
-        model = HuggingfaceModel(model_name="test-model", output_type=sample_output_type)
+        model = HuggingfaceModel(
+            model_name="test-model", output_type=sample_output_type
+        )
         assert model._is_seq2seq() is False
 
     def test_is_seq2seq_false_for_causal_model(
@@ -986,7 +988,9 @@ class TestSeq2Seq:
     ) -> None:
         """Test that _is_seq2seq returns False for decoder-only models."""
         mock_model.config.is_encoder_decoder = False
-        model = HuggingfaceModel(model_name="test-model", output_type=sample_output_type)
+        model = HuggingfaceModel(
+            model_name="test-model", output_type=sample_output_type
+        )
         model._model = mock_model
         assert model._is_seq2seq() is False
 
@@ -995,7 +999,9 @@ class TestSeq2Seq:
     ) -> None:
         """Test that _is_seq2seq returns True for encoder-decoder models."""
         mock_model.config.is_encoder_decoder = True
-        model = HuggingfaceModel(model_name="test-model", output_type=sample_output_type)
+        model = HuggingfaceModel(
+            model_name="test-model", output_type=sample_output_type
+        )
         model._model = mock_model
         assert model._is_seq2seq() is True
 
@@ -1017,10 +1023,7 @@ class TestSeq2Seq:
             return_tensors: str | None = None,
         ) -> dict[str, list[int]]:
             # Encoder prompt returns 5 tokens; JSON output returns 3 tokens
-            if text.startswith("{"):
-                tokens = [200, 201, 202]
-            else:
-                tokens = [10, 11, 12, 13, 14]
+            tokens = [200, 201, 202] if text.startswith("{") else [10, 11, 12, 13, 14]
             return {"input_ids": tokens, "attention_mask": [1] * len(tokens)}
 
         mock_tokenizer.side_effect = mock_tokenize
@@ -1036,8 +1039,10 @@ class TestSeq2Seq:
         inputs = ["Hello world"]
         outputs = [SampleOutput(name="T", value=1)]
 
-        input_ids, attention_mask, labels, token_type_ids = model._tokenize_for_training(
-            inputs, outputs, mock_tokenizer, max_seq_length=512
+        input_ids, attention_mask, labels, _token_type_ids = (
+            model._tokenize_for_training(
+                inputs, outputs, mock_tokenizer, max_seq_length=512
+            )
         )
 
         # Encoder input should be 5 tokens
@@ -1125,10 +1130,7 @@ class TestSeq2Seq:
             max_length: int | None = None,
             return_tensors: str | None = None,
         ) -> dict[str, list[int]]:
-            if text.startswith("{"):
-                tokens = [200, 201, 202]
-            else:
-                tokens = list(range(200))  # Too long for max_seq_length=100
+            tokens = [200, 201, 202] if text.startswith("{") else list(range(200))  # Too long for max_seq_length=100
             return {"input_ids": tokens, "attention_mask": [1] * len(tokens)}
 
         mock_tokenizer.side_effect = mock_tokenize
@@ -1143,8 +1145,10 @@ class TestSeq2Seq:
 
         with pytest.raises(ValueError, match="All training examples were skipped"):
             model._tokenize_for_training(
-                ["Very long prompt"], [SampleOutput(name="T", value=1)],
-                mock_tokenizer, max_seq_length=100
+                ["Very long prompt"],
+                [SampleOutput(name="T", value=1)],
+                mock_tokenizer,
+                max_seq_length=100,
             )
 
     def test_distillation_trainer_seq2seq_no_shift(self) -> None:
@@ -1180,3 +1184,275 @@ class TestSeq2Seq:
             loss = trainer.compute_loss(student_model, inputs)
             assert isinstance(loss, torch.Tensor)
             assert loss.dim() == 0
+
+
+# =============================================================================
+# LoRA Tests
+# =============================================================================
+
+
+class TestLoRA:
+    """Tests for LoRA (Low-Rank Adaptation) fine-tuning support."""
+
+    def test_lora_config_defaults(self) -> None:
+        """Test that LoraConfig has the expected defaults."""
+        from precipitate.huggingface import LoraConfig
+
+        cfg = LoraConfig()
+        assert cfg.r == 16
+        assert cfg.lora_alpha == 32
+        assert cfg.target_modules is None
+        assert cfg.lora_dropout == 0.05
+        assert cfg.bias == "none"
+
+    def test_lora_config_custom(self) -> None:
+        """Test that LoraConfig stores custom values."""
+        from precipitate.huggingface import LoraConfig
+
+        cfg = LoraConfig(
+            r=8, lora_alpha=16, target_modules=["q", "v"], lora_dropout=0.1, bias="all"
+        )
+        assert cfg.r == 8
+        assert cfg.lora_alpha == 16
+        assert cfg.target_modules == ["q", "v"]
+        assert cfg.lora_dropout == 0.1
+        assert cfg.bias == "all"
+
+    def test_lora_config_none_by_default(
+        self, sample_output_type: type[SampleOutput]
+    ) -> None:
+        """Test that lora_config defaults to None on HuggingfaceModel."""
+        model = HuggingfaceModel(
+            model_name="test-model", output_type=sample_output_type
+        )
+        assert model.lora_config is None
+
+    def test_lora_config_stored_on_init(
+        self, sample_output_type: type[SampleOutput]
+    ) -> None:
+        """Test that lora_config is stored when passed to __init__."""
+        from precipitate.huggingface import LoraConfig
+
+        cfg = LoraConfig(r=4)
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            lora_config=cfg,
+        )
+        assert model.lora_config is cfg
+
+    @patch("precipitate.huggingface.TrainingArguments")
+    @patch("precipitate.huggingface.Trainer")
+    @patch("precipitate.huggingface.AutoConfig")
+    @patch("precipitate.huggingface.AutoModelForCausalLM")
+    @patch("precipitate.huggingface.AutoTokenizer")
+    def test_fit_no_lora_by_default(
+        self,
+        mock_auto_tokenizer: MagicMock,
+        mock_auto_model: MagicMock,
+        mock_auto_config: MagicMock,
+        mock_trainer_class: MagicMock,
+        mock_training_args: MagicMock,
+        sample_output_type: type[SampleOutput],
+        sample_inputs: list[str],
+        sample_outputs: list[SampleOutput],
+        mock_tokenizer: MagicMock,
+        mock_model: MagicMock,
+    ) -> None:
+        """Test that get_peft_model is NOT called when lora_config is None."""
+        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+        mock_auto_model.from_pretrained.return_value = mock_model
+        mock_auto_config.from_pretrained.return_value.is_encoder_decoder = False
+
+        with patch("peft.get_peft_model") as mock_get_peft:
+            model = HuggingfaceModel(
+                model_name="test-model",
+                output_type=sample_output_type,
+                device="cpu",
+            )
+            model.fit(sample_inputs, sample_outputs)
+            mock_get_peft.assert_not_called()
+
+    @patch("precipitate.huggingface.TrainingArguments")
+    @patch("precipitate.huggingface.Trainer")
+    @patch("precipitate.huggingface.AutoConfig")
+    @patch("precipitate.huggingface.AutoModelForCausalLM")
+    @patch("precipitate.huggingface.AutoTokenizer")
+    def test_fit_applies_lora(
+        self,
+        mock_auto_tokenizer: MagicMock,
+        mock_auto_model: MagicMock,
+        mock_auto_config: MagicMock,
+        mock_trainer_class: MagicMock,
+        mock_training_args: MagicMock,
+        sample_output_type: type[SampleOutput],
+        sample_inputs: list[str],
+        sample_outputs: list[SampleOutput],
+        mock_tokenizer: MagicMock,
+        mock_model: MagicMock,
+    ) -> None:
+        """Test that get_peft_model is called when lora_config is set."""
+        from precipitate.huggingface import LoraConfig
+
+        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+        mock_auto_model.from_pretrained.return_value = mock_model
+        mock_auto_config.from_pretrained.return_value.is_encoder_decoder = False
+        # Simulate PeftModel returned by get_peft_model (must look like a real model)
+        mock_peft_model = MagicMock()
+        mock_peft_model.config.is_encoder_decoder = False
+
+        with (
+            patch("peft.get_peft_model", return_value=mock_peft_model) as mock_get_peft,
+            patch("peft.LoraConfig"),
+            patch("peft.TaskType"),
+        ):
+            model = HuggingfaceModel(
+                model_name="test-model",
+                output_type=sample_output_type,
+                device="cpu",
+                lora_config=LoraConfig(r=4),
+            )
+            model.fit(sample_inputs, sample_outputs)
+            mock_get_peft.assert_called_once()
+            # The stored model should be the PEFT-wrapped one
+            assert model._model is mock_peft_model
+
+    @patch("precipitate.huggingface.TrainingArguments")
+    @patch("precipitate.huggingface.Trainer")
+    @patch("precipitate.huggingface.AutoConfig")
+    @patch("precipitate.huggingface.AutoModelForCausalLM")
+    @patch("precipitate.huggingface.AutoTokenizer")
+    def test_fit_lora_enables_input_require_grads(
+        self,
+        mock_auto_tokenizer: MagicMock,
+        mock_auto_model: MagicMock,
+        mock_auto_config: MagicMock,
+        mock_trainer_class: MagicMock,
+        mock_training_args: MagicMock,
+        sample_output_type: type[SampleOutput],
+        sample_inputs: list[str],
+        sample_outputs: list[SampleOutput],
+        mock_tokenizer: MagicMock,
+        mock_model: MagicMock,
+    ) -> None:
+        """Test that enable_input_require_grads is called when LoRA + gradient checkpointing."""
+        from precipitate.huggingface import LoraConfig
+
+        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+        mock_auto_model.from_pretrained.return_value = mock_model
+        mock_auto_config.from_pretrained.return_value.is_encoder_decoder = False
+        mock_peft_model = MagicMock()
+        mock_peft_model.config.is_encoder_decoder = False
+
+        with (
+            patch("peft.get_peft_model", return_value=mock_peft_model),
+            patch("peft.LoraConfig"),
+            patch("peft.TaskType"),
+        ):
+            model = HuggingfaceModel(
+                model_name="test-model",
+                output_type=sample_output_type,
+                device="cpu",
+                lora_config=LoraConfig(r=4),
+            )
+            model.fit(sample_inputs, sample_outputs, use_gradient_checkpointing=True)
+            mock_peft_model.enable_input_require_grads.assert_called_once()
+
+    def test_lora_save_includes_config(
+        self,
+        sample_output_type: type[SampleOutput],
+        mock_model: MagicMock,
+        mock_tokenizer: MagicMock,
+    ) -> None:
+        """Test that save() serializes lora_config to config.json."""
+        import json
+        import tarfile
+        from io import BytesIO
+        from pathlib import Path
+
+        from precipitate.huggingface import LoraConfig
+
+        cfg = LoraConfig(r=8, lora_alpha=16)
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            lora_config=cfg,
+            device="cpu",
+        )
+
+        def mock_save_pretrained(path: str) -> None:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            (Path(path) / "dummy_file.txt").write_text("dummy")
+
+        mock_model.save_pretrained = mock_save_pretrained
+        mock_tokenizer.save_pretrained = mock_save_pretrained
+        model._model = mock_model
+        model._tokenizer = mock_tokenizer
+
+        stream = BytesIO()
+        model.save(stream)
+        stream.seek(0)
+
+        # Extract and inspect config.json
+        with tarfile.open(fileobj=stream, mode="r:gz") as tar:
+            config_member = tar.getmember("config.json")
+            config_data = json.loads(tar.extractfile(config_member).read())  # type: ignore[union-attr]
+
+        assert config_data["lora_config"] is not None
+        assert config_data["lora_config"]["r"] == 8
+        assert config_data["lora_config"]["lora_alpha"] == 16
+
+    def test_lora_load_uses_peft(
+        self,
+        sample_output_type: type[SampleOutput],
+        mock_model: MagicMock,
+        mock_tokenizer: MagicMock,
+    ) -> None:
+        """Test that load() calls PeftModel.from_pretrained when lora_config is present."""
+        from io import BytesIO
+        from pathlib import Path
+
+        from precipitate.huggingface import LoraConfig
+
+        cfg = LoraConfig(r=8)
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            lora_config=cfg,
+            device="cpu",
+        )
+
+        def mock_save_pretrained(path: str) -> None:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            (Path(path) / "dummy_file.txt").write_text("dummy")
+
+        mock_model.save_pretrained = mock_save_pretrained
+        mock_tokenizer.save_pretrained = mock_save_pretrained
+        model._model = mock_model
+        model._tokenizer = mock_tokenizer
+
+        stream = BytesIO()
+        model.save(stream)
+        stream.seek(0)
+
+        mock_peft_model = MagicMock()
+
+        with (
+            patch(
+                "precipitate.huggingface.AutoTokenizer.from_pretrained",
+                return_value=mock_tokenizer,
+            ),
+            patch("precipitate.huggingface.AutoConfig.from_pretrained") as mock_config,
+            patch(
+                "precipitate.huggingface.AutoModelForCausalLM.from_pretrained",
+                return_value=mock_model,
+            ),
+            patch(
+                "peft.PeftModel.from_pretrained", return_value=mock_peft_model
+            ) as mock_peft_load,
+        ):
+            mock_config.return_value.is_encoder_decoder = False
+            loaded = HuggingfaceModel.load(stream)
+            mock_peft_load.assert_called_once()
+            assert loaded.lora_config is not None
+            assert loaded.lora_config.r == 8
