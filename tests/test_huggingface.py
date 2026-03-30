@@ -455,6 +455,181 @@ class TestPredict:
 
 
 # =============================================================================
+# Predict Raw Tests
+# =============================================================================
+
+
+class TestPredictRaw:
+    """Tests for predict_raw — raw generation without outlines."""
+
+    @patch("precipitate.huggingface.AutoConfig")
+    @patch("precipitate.huggingface.AutoModelForCausalLM")
+    @patch("precipitate.huggingface.AutoTokenizer")
+    def test_predict_raw_does_not_use_outlines(
+        self,
+        mock_auto_tokenizer: MagicMock,
+        mock_auto_model: MagicMock,
+        mock_auto_config: MagicMock,
+        sample_output_type: type[SampleOutput],
+        mock_tokenizer: MagicMock,
+        mock_model: MagicMock,
+    ) -> None:
+        """predict_raw must not call outlines at all."""
+        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+        mock_auto_model.from_pretrained.return_value = mock_model
+        mock_auto_config.from_pretrained.return_value.is_encoder_decoder = False
+
+        # generate() returns a batch of token id tensors
+        import torch
+        mock_model.generate.return_value = torch.tensor([[1, 2, 3, 10, 11, 12]])
+        mock_tokenizer.decode.return_value = '{"name": "Test", "value": 1}'
+
+        with patch("precipitate.huggingface.outlines") as mock_outlines:
+            model = HuggingfaceModel(
+                model_name="test-model",
+                output_type=sample_output_type,
+                device="cpu",
+            )
+            model.predict_raw(["hello"])
+            mock_outlines.from_transformers.assert_not_called()
+            mock_outlines.Generator.assert_not_called()
+
+    @patch("precipitate.huggingface.AutoConfig")
+    @patch("precipitate.huggingface.AutoModelForCausalLM")
+    @patch("precipitate.huggingface.AutoTokenizer")
+    def test_predict_raw_causal_slices_prompt(
+        self,
+        mock_auto_tokenizer: MagicMock,
+        mock_auto_model: MagicMock,
+        mock_auto_config: MagicMock,
+        sample_output_type: type[SampleOutput],
+    ) -> None:
+        """For causal LMs, predict_raw slices off the prompt tokens."""
+        import torch
+
+        # Use fresh mocks so we control generate() and decode() precisely.
+        prompt_len = 4
+        new_token_ids = [10, 11, 12]
+
+        tok = MagicMock()
+        tok.pad_token = "<pad>"
+        tok.pad_token_id = 0
+        tok.chat_template = None
+        tok.return_value = {
+            "input_ids": torch.ones(1, prompt_len, dtype=torch.long),
+            "attention_mask": torch.ones(1, prompt_len, dtype=torch.long),
+        }
+
+        mdl = MagicMock()
+        mdl.config = MagicMock()
+        mdl.config.is_encoder_decoder = False
+        full_output = torch.cat(
+            [torch.ones(prompt_len, dtype=torch.long), torch.tensor(new_token_ids)]
+        ).unsqueeze(0)
+        mdl.generate.return_value = full_output
+
+        mock_auto_tokenizer.from_pretrained.return_value = tok
+        mock_auto_model.from_pretrained.return_value = mdl
+        mock_auto_config.from_pretrained.return_value.is_encoder_decoder = False
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            device="cpu",
+        )
+        model.predict_raw(["hello"])
+
+        # decode should receive only the new tokens, not the prompt
+        decoded_ids = tok.decode.call_args[0][0]
+        assert decoded_ids.tolist() == new_token_ids
+
+    @patch("precipitate.huggingface.AutoConfig")
+    @patch("precipitate.huggingface.AutoModelForSeq2SeqLM")
+    @patch("precipitate.huggingface.AutoTokenizer")
+    def test_predict_raw_seq2seq_no_slice(
+        self,
+        mock_auto_tokenizer: MagicMock,
+        mock_auto_model: MagicMock,
+        mock_auto_config: MagicMock,
+        sample_output_type: type[SampleOutput],
+    ) -> None:
+        """For seq2seq models, predict_raw passes decoder output as-is (no slice)."""
+        import torch
+
+        tok = MagicMock()
+        tok.pad_token = "<pad>"
+        tok.pad_token_id = 0
+        tok.chat_template = None
+        tok.return_value = {
+            "input_ids": torch.ones(1, 4, dtype=torch.long),
+            "attention_mask": torch.ones(1, 4, dtype=torch.long),
+        }
+
+        decoder_ids = [20, 21, 22]
+        mdl = MagicMock()
+        mdl.config = MagicMock()
+        mdl.config.is_encoder_decoder = True
+        mdl.generate.return_value = torch.tensor([decoder_ids])
+
+        mock_auto_tokenizer.from_pretrained.return_value = tok
+        mock_auto_model.from_pretrained.return_value = mdl
+        mock_auto_config.from_pretrained.return_value.is_encoder_decoder = True
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            device="cpu",
+        )
+        model.predict_raw(["hello"])
+
+        # decode should receive all decoder output tokens without any slicing
+        decoded_ids = tok.decode.call_args[0][0]
+        assert decoded_ids.tolist() == decoder_ids
+
+    @patch("precipitate.huggingface.AutoConfig")
+    @patch("precipitate.huggingface.AutoModelForCausalLM")
+    @patch("precipitate.huggingface.AutoTokenizer")
+    def test_predict_raw_returns_strings(
+        self,
+        mock_auto_tokenizer: MagicMock,
+        mock_auto_model: MagicMock,
+        mock_auto_config: MagicMock,
+        sample_output_type: type[SampleOutput],
+    ) -> None:
+        """predict_raw returns a list[str], one per input."""
+        import torch
+
+        tok = MagicMock()
+        tok.pad_token = "<pad>"
+        tok.pad_token_id = 0
+        tok.chat_template = None
+        tok.return_value = {
+            "input_ids": torch.ones(1, 3, dtype=torch.long),
+            "attention_mask": torch.ones(1, 3, dtype=torch.long),
+        }
+        tok.decode.side_effect = ["first", "second", "third"]
+
+        mdl = MagicMock()
+        mdl.config = MagicMock()
+        mdl.config.is_encoder_decoder = False
+        mdl.generate.return_value = torch.tensor([[1, 2, 3, 4, 5]])
+
+        mock_auto_tokenizer.from_pretrained.return_value = tok
+        mock_auto_model.from_pretrained.return_value = mdl
+        mock_auto_config.from_pretrained.return_value.is_encoder_decoder = False
+
+        model = HuggingfaceModel(
+            model_name="test-model",
+            output_type=sample_output_type,
+            device="cpu",
+        )
+        results = model.predict_raw(["a", "b", "c"])
+
+        assert results == ["first", "second", "third"]
+        assert all(isinstance(r, str) for r in results)
+
+
+# =============================================================================
 # Distill Method Tests
 # =============================================================================
 

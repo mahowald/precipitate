@@ -678,13 +678,26 @@ class HuggingfaceModel(Generic[T]):
             self._outlines_model = None  # invalidate outlines cache
 
         # Enable gradient checkpointing if requested
+        _saved_cache_implementation = None
         if use_gradient_checkpointing:
+            # Both config and generation_config carry use_cache; clear both before
+            # calling gradient_checkpointing_enable() to suppress the warning.
+            model.config.use_cache = False
+            if hasattr(model, "generation_config"):
+                model.generation_config.use_cache = False
+                # cache_implementation (e.g. "hybrid" on Gemma-T5) is only valid when
+                # use_cache=True.  Save and clear it so the Trainer's epoch checkpoint
+                # saves don't fail GenerationConfig.validate().
+                _saved_cache_implementation = getattr(
+                    model.generation_config, "cache_implementation", None
+                )
+                if _saved_cache_implementation is not None:
+                    model.generation_config.cache_implementation = None
             if self.lora_config is not None:
                 # PEFT requires this before gradient checkpointing so gradients
                 # flow through the frozen base model to the adapter layers.
                 model.enable_input_require_grads()
             model.gradient_checkpointing_enable()
-            model.config.use_cache = False  # incompatible with gradient checkpointing
 
         # Tokenize with masked labels
         input_ids, attention_mask, labels, token_type_ids = self._tokenize_for_training(
@@ -733,7 +746,9 @@ class HuggingfaceModel(Generic[T]):
             bf16=self._get_device().type == "cuda",
             dataloader_pin_memory=False,  # For MPS compatibility
             optim=optim,
-            gradient_checkpointing=use_gradient_checkpointing,
+            # gradient_checkpointing is handled manually above so the Trainer does
+            # not call gradient_checkpointing_enable() a second time (which would
+            # reset use_cache and re-emit the incompatibility warning).
         )
 
         # Train
@@ -745,28 +760,29 @@ class HuggingfaceModel(Generic[T]):
 
         trainer.train()
 
+        # Restore model to inference-ready state after training
+        if use_gradient_checkpointing:
+            model.gradient_checkpointing_disable()
+            model.config.use_cache = True
+            if hasattr(model, "generation_config"):
+                model.generation_config.use_cache = True
+                if _saved_cache_implementation is not None:
+                    model.generation_config.cache_implementation = _saved_cache_implementation
+        model.eval()
+
     def predict(self, inputs: list[str]) -> list[T]:
         """Generate predictions with constrained generation.
 
         Uses outlines to guarantee outputs match the Pydantic schema.
         Returns a list of Pydantic model instances parsed from the generated JSON.
         """
-        return [
-            self.output_type.model_validate_json(s) for s in self.predict_raw(inputs)
-        ]
-
-    def predict_raw(self, inputs: list[str]) -> list[str]:
-        """Generate raw string outputs without schema validation.
-
-        Same as predict() but returns the generated strings directly rather than
-        parsing them into Pydantic instances. Useful for debugging when the model
-        produces truncated or malformed JSON.
-        """
+        model, tokenizer = self._load_model_and_tokenizer()
+        model.eval()
         outlines_model = self._get_outlines_model()
         tokenizer = cast(PreTrainedTokenizerBase, self._tokenizer)
         generator = outlines.Generator(outlines_model, self.output_type)
 
-        results: list[str] = []
+        results: list[T] = []
 
         for input_text in inputs:
             messages = self._build_chat_messages(input_text, None)
@@ -778,7 +794,53 @@ class HuggingfaceModel(Generic[T]):
                 max_new_tokens=self.max_new_tokens,
                 temperature=self.temperature if self.temperature > 0 else None,
             )
-            results.append(cast(str, output_str))
+            results.append(self.output_type.model_validate_json(cast(str, output_str)))
+
+        return results
+
+    def predict_raw(self, inputs: list[str]) -> list[str]:
+        """Generate raw string outputs without schema constraints.
+
+        Calls model.generate() directly without outlines. Useful for debugging
+        after training — the model may produce truncated or malformed JSON, but
+        generation will always complete and return a string.
+        """
+        model, tokenizer = self._load_model_and_tokenizer()
+        model.eval()
+        device = self._get_device()
+        is_seq2seq = self._is_seq2seq()
+
+        results: list[str] = []
+
+        for input_text in inputs:
+            messages = self._build_chat_messages(input_text, None)
+            prompt = self._apply_chat_template(
+                tokenizer, messages, add_generation_prompt=True
+            )
+            encoded = tokenizer(prompt, return_tensors="pt", truncation=False)
+            input_ids = encoded["input_ids"].to(device)
+            attention_mask = encoded["attention_mask"].to(device)
+
+            generate_kwargs: dict[str, Any] = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "max_new_tokens": self.max_new_tokens,
+            }
+            if self.temperature > 0:
+                generate_kwargs["do_sample"] = True
+                generate_kwargs["temperature"] = self.temperature
+
+            with torch.no_grad():
+                output_ids = model.generate(**generate_kwargs)  # type: ignore[operator]
+
+            # Seq2seq models return decoder output only; causal LMs include the
+            # input prompt tokens and must be sliced off.
+            if is_seq2seq:
+                new_ids = output_ids[0]
+            else:
+                new_ids = output_ids[0][input_ids.shape[1]:]
+
+            results.append(tokenizer.decode(new_ids, skip_special_tokens=True))
 
         return results
 
@@ -842,13 +904,19 @@ class HuggingfaceModel(Generic[T]):
             student._outlines_model = None
 
         # Enable gradient checkpointing on student if requested
+        _saved_student_cache_implementation = None
         if use_gradient_checkpointing:
+            student_model.config.use_cache = False
+            if hasattr(student_model, "generation_config"):
+                student_model.generation_config.use_cache = False
+                _saved_student_cache_implementation = getattr(
+                    student_model.generation_config, "cache_implementation", None
+                )
+                if _saved_student_cache_implementation is not None:
+                    student_model.generation_config.cache_implementation = None
             if student.lora_config is not None:
                 student_model.enable_input_require_grads()
             student_model.gradient_checkpointing_enable()
-            student_model.config.use_cache = (
-                False  # incompatible with gradient checkpointing
-            )
 
         # Tokenize with student tokenizer
         input_ids, attention_mask, labels, token_type_ids = (
@@ -899,8 +967,9 @@ class HuggingfaceModel(Generic[T]):
             bf16=student._get_device().type == "cuda",
             dataloader_pin_memory=False,  # For MPS compatibility
             optim=optim,
-            gradient_checkpointing=use_gradient_checkpointing,
             remove_unused_columns=False,
+            # gradient_checkpointing is handled manually above so the Trainer does
+            # not call gradient_checkpointing_enable() a second time.
         )
 
         # Train with distillation
@@ -914,6 +983,18 @@ class HuggingfaceModel(Generic[T]):
         )
 
         trainer.train()
+
+        # Restore student model to inference-ready state after training
+        if use_gradient_checkpointing:
+            student_model.gradient_checkpointing_disable()
+            student_model.config.use_cache = True
+            if hasattr(student_model, "generation_config"):
+                student_model.generation_config.use_cache = True
+                if _saved_student_cache_implementation is not None:
+                    student_model.generation_config.cache_implementation = (
+                        _saved_student_cache_implementation
+                    )
+        student_model.eval()
 
     def save(self, stream: BinaryIO) -> None:
         """Save the model, tokenizer, and configuration to a binary stream.
