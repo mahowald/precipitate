@@ -642,6 +642,7 @@ class HuggingfaceModel(Generic[T]):
         optimizer_type: str = "adamw_torch_fused",
         max_grad_norm: float = 1.0,
         per_device_eval_batch_size: int | None = None,
+        save_steps: int = 100,
         output_dir: str = "./hf_model_output",
     ) -> None:
         """Fine-tune the model on input-output pairs.
@@ -742,7 +743,8 @@ class HuggingfaceModel(Generic[T]):
             weight_decay=weight_decay,
             max_grad_norm=max_grad_norm,
             logging_steps=10,
-            save_strategy="epoch",
+            save_strategy="steps",
+            save_steps=save_steps,
             bf16=self._get_device().type == "cuda",
             dataloader_pin_memory=False,  # For MPS compatibility
             optim=optim,
@@ -778,6 +780,8 @@ class HuggingfaceModel(Generic[T]):
         """
         model, tokenizer = self._load_model_and_tokenizer()
         model.eval()
+        device = self._get_device()
+        model.to(device)
         outlines_model = self._get_outlines_model()
         tokenizer = cast(PreTrainedTokenizerBase, self._tokenizer)
         generator = outlines.Generator(outlines_model, self.output_type)
@@ -808,6 +812,7 @@ class HuggingfaceModel(Generic[T]):
         model, tokenizer = self._load_model_and_tokenizer()
         model.eval()
         device = self._get_device()
+        model.to(device)
         is_seq2seq = self._is_seq2seq()
 
         results: list[str] = []
@@ -862,6 +867,7 @@ class HuggingfaceModel(Generic[T]):
         optimizer_type: str = "adamw_torch_fused",
         max_grad_norm: float = 1.0,
         per_device_eval_batch_size: int | None = None,
+        save_steps: int = 100,
         output_dir: str = "./hf_model_output",
     ) -> None:
         """Distill knowledge from this model (teacher) to the student model.
@@ -963,7 +969,8 @@ class HuggingfaceModel(Generic[T]):
             weight_decay=weight_decay,
             max_grad_norm=max_grad_norm,
             logging_steps=10,
-            save_strategy="epoch",
+            save_strategy="steps",
+            save_steps=save_steps,
             bf16=student._get_device().type == "cuda",
             dataloader_pin_memory=False,  # For MPS compatibility
             optim=optim,
