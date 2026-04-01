@@ -229,6 +229,7 @@ class HuggingfaceModel(Generic[T]):
         self._tokenizer: PreTrainedTokenizerBase | None = None
         self._model: PreTrainedModel | None = None
         self._outlines_model: Any | None = None
+        self._outlines_generator: Any | None = None
 
     def _get_device(self) -> torch.device:
         """Auto-detect best available device."""
@@ -299,6 +300,18 @@ class HuggingfaceModel(Generic[T]):
                 tokenizer_or_processor=tokenizer,  # type: ignore[arg-type]
             )
         return self._outlines_model
+
+    def _get_outlines_generator(self) -> Any:  # noqa: ANN401
+        """Get or create the outlines Generator for constrained generation.
+
+        Compiling the FSM from the Pydantic schema is expensive (5-20+ seconds).
+        Caching the generator avoids recompilation on every predict() call.
+        """
+        if self._outlines_generator is None:
+            self._outlines_generator = outlines.Generator(
+                self._get_outlines_model(), self.output_type
+            )
+        return self._outlines_generator
 
     def _apply_lora(self, model: PreTrainedModel) -> PreTrainedModel:
         """Wrap a base model with LoRA adapter layers.
@@ -677,6 +690,7 @@ class HuggingfaceModel(Generic[T]):
             model = self._apply_lora(model)
             self._model = model
             self._outlines_model = None  # invalidate outlines cache
+            self._outlines_generator = None
 
         # Enable gradient checkpointing if requested
         _saved_cache_implementation = None
@@ -782,9 +796,8 @@ class HuggingfaceModel(Generic[T]):
         model.eval()
         device = self._get_device()
         model.to(device)
-        outlines_model = self._get_outlines_model()
         tokenizer = cast(PreTrainedTokenizerBase, self._tokenizer)
-        generator = outlines.Generator(outlines_model, self.output_type)
+        generator = self._get_outlines_generator()
 
         results: list[T] = []
 
@@ -815,36 +828,47 @@ class HuggingfaceModel(Generic[T]):
         model.to(device)
         is_seq2seq = self._is_seq2seq()
 
-        results: list[str] = []
+        # Causal LMs require left-padding so all sequences end flush at the
+        # right; the prompt length is then uniform and can be sliced off cleanly.
+        original_padding_side = tokenizer.padding_side
+        if not is_seq2seq:
+            tokenizer.padding_side = "left"
 
-        for input_text in inputs:
-            messages = self._build_chat_messages(input_text, None)
-            prompt = self._apply_chat_template(
-                tokenizer, messages, add_generation_prompt=True
+        prompts = [
+            self._apply_chat_template(
+                tokenizer,
+                self._build_chat_messages(input_text, None),
+                add_generation_prompt=True,
             )
-            encoded = tokenizer(prompt, return_tensors="pt", truncation=False)
-            input_ids = encoded["input_ids"].to(device)
-            attention_mask = encoded["attention_mask"].to(device)
+            for input_text in inputs
+        ]
+        encoded = tokenizer(
+            prompts, return_tensors="pt", padding=True, truncation=False
+        )
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask = encoded["attention_mask"].to(device)
 
-            generate_kwargs: dict[str, Any] = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "max_new_tokens": self.max_new_tokens,
-            }
-            if self.temperature > 0:
-                generate_kwargs["do_sample"] = True
-                generate_kwargs["temperature"] = self.temperature
+        if not is_seq2seq:
+            tokenizer.padding_side = original_padding_side
 
-            with torch.no_grad():
-                output_ids = model.generate(**generate_kwargs)  # type: ignore[operator]
+        generate_kwargs: dict[str, Any] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "max_new_tokens": self.max_new_tokens,
+        }
+        if self.temperature > 0:
+            generate_kwargs["do_sample"] = True
+            generate_kwargs["temperature"] = self.temperature
 
+        with torch.no_grad():
+            output_ids = model.generate(**generate_kwargs)  # type: ignore[operator]
+
+        results: list[str] = []
+        prompt_len = input_ids.shape[1]
+        for out in output_ids:
             # Seq2seq models return decoder output only; causal LMs include the
-            # input prompt tokens and must be sliced off.
-            if is_seq2seq:
-                new_ids = output_ids[0]
-            else:
-                new_ids = output_ids[0][input_ids.shape[1]:]
-
+            # (left-padded) input prompt tokens and must be sliced off.
+            new_ids = out if is_seq2seq else out[prompt_len:]
             results.append(tokenizer.decode(new_ids, skip_special_tokens=True))
 
         return results
@@ -908,6 +932,7 @@ class HuggingfaceModel(Generic[T]):
             student_model = student._apply_lora(student_model)
             student._model = student_model
             student._outlines_model = None
+            student._outlines_generator = None
 
         # Enable gradient checkpointing on student if requested
         _saved_student_cache_implementation = None
