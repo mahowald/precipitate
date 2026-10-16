@@ -1,3 +1,4 @@
+# Harness spike, version 2.
 name: Spike checks
 on:
   push:
@@ -11,7 +12,7 @@ jobs:
     name: Detect changed areas
     runs-on: ubuntu-latest
     steps:
-      - run: sleep 20
+      - run: sleep 15
   shards:
     name: Unit tests (shard ${{ matrix.shard }})
     needs: changes
