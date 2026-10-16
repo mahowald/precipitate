@@ -1,0 +1,32 @@
+name: Spike checks
+on:
+  push:
+    branches: ["ragnerock-spike/**"]
+  pull_request:
+concurrency:
+  group: spike-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 20
+  shards:
+    name: Unit tests (shard ${{ matrix.shard }})
+    needs: changes
+    strategy:
+      matrix:
+        shard: [1, 2]
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 30
+  unit-tests:
+    name: Unit tests
+    needs: [changes, shards]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "FAILED tests/test_spike.py::test_fails_on_purpose"
+          exit 1
